@@ -15,6 +15,21 @@ def get_packed_cp_local_indices(
     """Map a THD CP rank's local tokens back to the full packed token stream."""
 
     boundaries = [int(value) for value in cu_seqlens]
+    if not boundaries:
+        return torch.empty(0, dtype=torch.long, device=device)
+
+    if cp_size == 1:
+        # Without context parallelism every token is already local, so the
+        # mapping is the identity over the packed stream. The loop below does
+        # compute exactly that at cp_size 1 -- the first half of each sequence
+        # followed by its second half -- but only for even lengths: the
+        # divisibility check guards the two-chunk CP layout, and at cp_size 1
+        # there is nothing to split. Leaving the check in the path rejected
+        # legitimate odd-length packs, e.g. "Packed sequence length 4551 must be
+        # divisible by 2 * CP size 1" at rollout 0 of jobs 2460609 (1 node) and
+        # 2460633 (2 nodes).
+        return torch.arange(boundaries[0], boundaries[-1], device=device)
+
     indices = []
     for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
         sequence_length = end - start

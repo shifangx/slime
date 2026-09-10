@@ -79,6 +79,20 @@ def test_thd_cp_indices_select_two_chunks_per_packed_sequence():
 
 
 @pytest.mark.unit
+def test_thd_cp_indices_are_the_identity_without_context_parallelism():
+    # cp_size 1 has nothing to split, so every token of the pack is local. The
+    # two-chunk divisibility check does not apply and must not reject an
+    # odd-length sequence -- it did, and took rollout 0 of a GEO3K run down with
+    # "Packed sequence length 4551 must be divisible by 2 * CP size 1".
+    odd = get_packed_cp_local_indices([0, 5], cp_size=1, cp_rank=0, device=torch.device("cpu"))
+    mixed = get_packed_cp_local_indices([0, 4, 9], cp_size=1, cp_rank=0, device=torch.device("cpu"))
+
+    assert odd.tolist() == list(range(5))
+    assert mixed.tolist() == list(range(9))
+    assert odd.dtype == torch.long
+
+
+@pytest.mark.unit
 def test_raw_qkv_loader_is_inverse_of_exporter():
     hidden_size = 3
     q = torch.arange(16 * hidden_size).reshape(16, hidden_size)
