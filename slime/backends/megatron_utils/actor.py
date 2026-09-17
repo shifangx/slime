@@ -53,6 +53,57 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def assert_expected_memory_saver_mode(args: Namespace) -> None:
+    """Fail fast when something switched torch_memory_saver out of preload mode.
+
+    With --offload-train, slime hands this process the preload hook: LD_PRELOAD
+    points at torch_memory_saver_hook_mode_preload_*.so and TMS_INIT_ENABLE=1 is
+    set (slime/ray/actor_group.py).  hook_mode is process-global and consumed on
+    first use, so any import side effect that sets it to "torch" -- Megatron has
+    shipped two such lines, megatron/training/training.py and
+    megatron/core/inference/contexts/dynamic_context.py -- silently leaves two
+    TMS backends in the process: the preloaded one interposing cudaMalloc, and a
+    torch-mode one behind the Python object.  torch_memory_saver.disable() then
+    clears the region flag on the wrong library, allocations made in that window
+    stay VMM-backed, and the colocated weight sync dies exporting a CUDA IPC
+    handle (storage._share_cuda_ -> cudaErrorInvalidValue, jobs 18797342 and
+    18797223) after several minutes of startup.
+
+    Checking here costs nothing and turns that into a startup error naming the
+    cause.  Everything read below is private to torch_memory_saver, so an API
+    change downgrades this to a warning rather than breaking the run.
+    """
+    if not args.offload_train:
+        return
+
+    try:
+        impl = torch_memory_saver._impl
+        if impl is not None:
+            hook_mode = impl._hook_mode
+        else:
+            # Not initialized yet: the mode is whatever was configured last.
+            hook_mode = torch_memory_saver._impl_ctor_kwargs.get("hook_mode", "preload")
+    except AttributeError:
+        logger.warning(
+            "Cannot read torch_memory_saver's hook mode; skipping the preload-mode check. "
+            "If the colocated weight sync fails in storage._share_cuda_ with "
+            "'CUDA error: invalid argument', check whether something set "
+            "torch_memory_saver.hook_mode = 'torch' at import time."
+        )
+        return
+
+    if hook_mode != "preload":
+        raise RuntimeError(
+            f"torch_memory_saver is in hook_mode={hook_mode!r}, but --offload-train set this "
+            "process up for 'preload' (LD_PRELOAD + TMS_INIT_ENABLE=1). Something imported at "
+            "startup set the mode process-globally; Megatron's own candidates are "
+            "megatron/training/training.py and megatron/core/inference/contexts/dynamic_context.py. "
+            "Leaving it would break the colocated weight sync's CUDA IPC export. Patch the setter "
+            "out of the Megatron checkout (slime/docker/patch/latest/megatron*.patch does this) or "
+            "run without --offload-train."
+        )
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -65,6 +116,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if args.debug_rollout_only:
             self.args = args
             return 0
+
+        # Before anything allocates: every Megatron module this file needs is
+        # imported by now, so a stray hook_mode setter has already run.
+        assert_expected_memory_saver_mode(args)
 
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
