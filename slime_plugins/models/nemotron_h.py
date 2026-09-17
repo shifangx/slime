@@ -29,13 +29,46 @@ needs on top of that -- latent MoE, sigmoid routing with an expert bias, a
 shared expert, squared-ReLU experts -- is ordinary ``TransformerConfig``, which
 is why this file has no modules in it.
 
-Verified against megatron.core 0.16.0rc0, NVIDIA/Megatron-LM ``1dcf0daf``.
+TWO MEGATRONS
+-------------
+This file is loaded by both backends this tree runs: the container image's
+megatron.core 0.16.0rc0 (NVIDIA/Megatron-LM ``1dcf0daf``) and the workspace
+checkout's 0.20 (``9e68a11b``). 0.19 renamed the whole hybrid stack --
+``MambaModel`` -> ``HybridModel``, ``ssm/mamba_hybrid_layer_allocation`` ->
+``models/hybrid/hybrid_layer_allocation``, ``--hybrid-override-pattern`` ->
+``--hybrid-layer-pattern`` -- and kept re-export shims for every old name, so
+the imports below resolve on both. The two places where the shim is not enough
+are handled explicitly and marked ``0.16 / 0.20``:
+
+* the layer pattern, which 0.20 reads from ``hybrid_layer_pattern``;
+* ``loss_mask``, which 0.20's ``forward`` finally declares.
 """
 
 from __future__ import annotations
 
+import inspect
+
 from megatron.core.models.mamba import MambaModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+
+# 0.16 / 0.20. `hybrid_override_pattern` is deprecated but still accepted on
+# 0.20 (it logs a warning and copies itself over), so this is about spelling the
+# supported name rather than about working at all. Asking the class that owns
+# the parameter, not `MambaModel`, because on 0.20 `MambaModel.__init__` is a
+# `**kwargs` shim and its signature says nothing.
+try:
+    from megatron.core.models.hybrid.hybrid_model import HybridModel as _pattern_owner
+except ImportError:  # megatron.core < 0.19
+    _pattern_owner = MambaModel
+
+_PATTERN_KWARG = (
+    "hybrid_layer_pattern"
+    if "hybrid_layer_pattern" in inspect.signature(_pattern_owner.__init__).parameters
+    else "hybrid_override_pattern"
+)
+
+# 0.16 / 0.20. See NemotronHModel.forward.
+_PARENT_FORWARD_TAKES_LOSS_MASK = "loss_mask" in inspect.signature(MambaModel.forward).parameters
 
 
 class NemotronHModel(MambaModel):
@@ -43,25 +76,27 @@ class NemotronHModel(MambaModel):
 
     slime builds its forward kwargs unconditionally
     (``slime/backends/megatron_utils/model.py``) and ``loss_mask`` is always
-    among them. ``GPTModel.forward`` declares it keyword-only;
-    ``MambaModel.forward`` does not, and the string ``loss_mask`` does not occur
-    anywhere in ``mamba_model.py``. Without this subclass the first microbatch
-    dies with::
+    among them. ``GPTModel.forward`` declares it keyword-only; ``MambaModel``
+    did not until megatron.core 0.19, and on 0.16 the string ``loss_mask`` does
+    not occur anywhere in ``mamba_model.py``. Without this subclass the first
+    microbatch dies there with::
 
         TypeError: forward() got an unexpected keyword argument 'loss_mask'
 
-    Dropping it loses nothing for this stack. In ``GPTModel`` the argument feeds
-    exactly one consumer -- the multi-token-prediction block, entered alongside
-    ``mtp_in_postprocess=self.mtp_process`` -- and a Mamba stack has no MTP block
-    at all. If MTP is ever configured, silently discarding the mask would be
-    wrong, so that case raises instead.
+    Dropping it loses nothing on that backend. In ``GPTModel`` the argument
+    feeds exactly one consumer -- the multi-token-prediction block, entered
+    alongside ``mtp_in_postprocess=self.mtp_process`` -- and a 0.16 Mamba stack
+    has no MTP block at all. If MTP is ever configured there, silently
+    discarding the mask would be wrong, so that case raises instead.
 
-    The cleaner fix belongs upstream of here: slime could pass ``loss_mask`` only
-    to models that declare it, which is one ``inspect.signature`` call at the
-    call site and would let every non-GPT provider drop this subclass.
+    0.20's ``HybridModel.forward`` declares ``loss_mask`` and does grow an MTP
+    block (a ``/``-separated hybrid pattern builds one), so on that backend the
+    mask is handed straight through and this subclass costs nothing but a frame.
     """
 
     def forward(self, *args, loss_mask=None, **kwargs):
+        if _PARENT_FORWARD_TAKES_LOSS_MASK:
+            return super().forward(*args, loss_mask=loss_mask, **kwargs)
         if loss_mask is not None and getattr(self.config, "mtp_num_layers", None):
             raise ValueError(
                 "nemotron_h: loss_mask was passed with mtp_num_layers set, but a Mamba stack "
@@ -80,6 +115,7 @@ def get_nemotron_h_spec(args, config, vp_stage: int | None = None):
     flags into the fields ``MambaMixer`` reads, and slime has already made it.
     """
     _assert_supported(args, config, vp_stage)
+    pattern = _hybrid_pattern(args)
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None):
         _assert_no_virtual_pipeline(vp_stage)
@@ -95,7 +131,11 @@ def get_nemotron_h_spec(args, config, vp_stage: int | None = None):
             # argument defaults (0.0) and the pattern decides.
             hybrid_attention_ratio=args.hybrid_attention_ratio,
             hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-            hybrid_override_pattern=args.hybrid_override_pattern,
+            # 0.16 / 0.20, see _PATTERN_KWARG. Passing the pattern under the
+            # name this megatron.core retired would not raise -- it would build
+            # an all-Mamba stack of the right depth and fail much later, on a
+            # checkpoint key that does not exist.
+            **{_PATTERN_KWARG: pattern},
             post_process=post_process,
             fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
             parallel_output=True,
@@ -111,15 +151,41 @@ def get_nemotron_h_spec(args, config, vp_stage: int | None = None):
 
 
 def _assert_no_virtual_pipeline(vp_stage: int | None) -> None:
-    # MambaStack takes no vp_stage and megatron's own mamba_builder never passes
-    # one, so a virtual-pipeline schedule would build the wrong number of layers
-    # per chunk and surface only as a shape mismatch deep in the checkpoint load.
-    # Refuse it where the message can still say why.
+    # 0.16's MambaStack takes no vp_stage and megatron's own mamba_builder never
+    # passes one, so a virtual-pipeline schedule would build the wrong number of
+    # layers per chunk and surface only as a shape mismatch deep in the
+    # checkpoint load. 0.20's HybridStack does implement VPP, through `|`
+    # segments in the pattern -- but slime derives its global parameter names
+    # from get_transformer_layer_offset(), which knows nothing about those
+    # segments, so the two would disagree about which layer is which. Refuse it
+    # on both backends, where the message can still say why.
     if vp_stage is not None:
         raise ValueError(
-            "nemotron_h: virtual pipeline parallelism is not supported by MambaStack; "
-            "drop --num-layers-per-virtual-pipeline-stage."
+            "nemotron_h: virtual pipeline parallelism is not supported here; drop "
+            "--num-layers-per-virtual-pipeline-stage (megatron.core >= 0.19: drop the '|' "
+            "pipeline separators from the hybrid layer pattern)."
         )
+
+
+def _hybrid_pattern(args) -> str | None:
+    """The layer pattern, under whichever flag this megatron.core spells it.
+
+    0.16 / 0.20. 0.20's ``validate_args`` copies ``--hybrid-override-pattern``
+    into ``args.hybrid_layer_pattern`` and leaves the old attribute in place, so
+    both are set on that backend and either order works; the new name is
+    preferred so that a launcher which passes ``--hybrid-layer-pattern``
+    directly is not read as "no pattern at all".
+    """
+    return getattr(args, "hybrid_layer_pattern", None) or getattr(args, "hybrid_override_pattern", None)
+
+
+def _pattern_layer_count(pattern: str) -> int:
+    """Layers in *pattern*, which on 0.20 may carry ``|`` and ``/`` separators."""
+    try:
+        from megatron.core.models.hybrid.hybrid_layer_allocation import get_hybrid_total_layer_count
+    except ImportError:  # megatron.core < 0.19: one character, one layer
+        return len(pattern)
+    return get_hybrid_total_layer_count(pattern)
 
 
 def _assert_supported(args, config, vp_stage: int | None) -> None:
@@ -132,10 +198,12 @@ def _assert_supported(args, config, vp_stage: int | None) -> None:
     # not the model the checkpoint holds.
     if not config.is_hybrid_model:
         raise ValueError("nemotron_h: --is-hybrid-model is required")
-    if not args.hybrid_override_pattern:
-        raise ValueError("nemotron_h: --hybrid-override-pattern is required")
-    if len(args.hybrid_override_pattern) != args.num_layers:
+    pattern = _hybrid_pattern(args)
+    if not pattern:
+        raise ValueError("nemotron_h: --hybrid-override-pattern (0.20: --hybrid-layer-pattern) is required")
+    num_layers_in_pattern = _pattern_layer_count(pattern)
+    if num_layers_in_pattern != args.num_layers:
         raise ValueError(
-            f"nemotron_h: --hybrid-override-pattern has {len(args.hybrid_override_pattern)} "
+            f"nemotron_h: the hybrid layer pattern has {num_layers_in_pattern} "
             f"layers but --num-layers is {args.num_layers}"
         )
