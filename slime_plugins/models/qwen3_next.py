@@ -184,7 +184,11 @@ class Attention(HuggingfaceAttention):
         cp_comm_type: str = "p2p",
         pg_collection=None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
+        # is_mtp_layer is accepted for TransformerLayer compatibility and ignored because the
+        # linear-attention layers are never built as MTP layers.
+        del is_mtp_layer
         super().__init__(
             args,
             config,
