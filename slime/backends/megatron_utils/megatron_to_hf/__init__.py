@@ -39,7 +39,10 @@ def _convert_to_hf_core(args, model_name, name, param):
     # `NemotronHConfig` normalises to "nemotronhconfig"; the HF model_type spelling
     # `nemotron_h` normalises to the same "nemotronh" for an explicit --model-name.
     elif "nemotronh" in model_name:
-        converted_named_tensors = convert_nemotron_h_to_hf(args, name, param)
+        # model_name is forwarded because Nemotron-3 and Nemotron 3.5 Super VL
+        # normalise into this same branch, and the VL one has to prefix its
+        # language tensors with `language_model.` -- see that module.
+        converted_named_tensors = convert_nemotron_h_to_hf(args, name, param, model_name)
     elif any(family in model_name for family in ("glm4moelite", "deepseekv3", "deepseekv32", "glmmoedsa", "kimi")):
         converted_named_tensors = convert_deepseekv3_to_hf(args, name, param)
     elif "glm4moe" in model_name:

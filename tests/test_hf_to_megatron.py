@@ -566,3 +566,108 @@ def test_reader_dequantizes_block_scaled_fp8(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+# ---------------------------------------------------------------------------
+# Nemotron 3.5 Super VL. Everything above is the text Nemotron-3; these three
+# tests cover what job 18823425 found the hard way -- the first RL run to reach
+# update_weights on the VL model died in the exporter, twice over.
+# ---------------------------------------------------------------------------
+
+_NEMOTRON_VL_CONFIG = types.SimpleNamespace(
+    model_type="nemotron_h_omni",
+    llm_config=_NEMOTRON_CONFIG,
+    vision_config=types.SimpleNamespace(
+        hidden_size=6,
+        summary_idxs=[0, 1],
+        layerscale_value=1.0,
+    ),
+)
+
+# `_convert_to_hf_core` lowercases and strips _/- from the model name. Both the
+# config class and an explicit --model-name normalise into the "nemotronh"
+# branch, and only the VL one carries "omni".
+_VL_MODEL_NAME = "nemotronhomnireasoningv3config"
+
+
+@pytest.mark.unit
+def test_nemotron_vl_prefixes_the_language_tower():
+    """42,683 of the checkpoint's 43,078 tensors live under `language_model.`.
+
+    SGLang's NemotronH_Nano_VL_V2.load_weights routes on four prefixes with no
+    else branch, so an unprefixed name is dropped in silence -- the sync reports
+    success and the engine keeps its startup weights forever. This is the bug
+    that would have survived fixing the vision half alone.
+    """
+    embedding = convert_nemotron_h_to_hf(
+        _NEMOTRON_ARGS, "module.module.embedding.word_embeddings.weight", torch.randn(4, 8), _VL_MODEL_NAME
+    )
+    assert [name for name, _ in embedding] == ["language_model.backbone.embeddings.weight"]
+
+    layer = convert_nemotron_h_to_hf(
+        _NEMOTRON_ARGS, "module.module.decoder.layers.2.mlp.router.expert_bias", torch.randn(4), _VL_MODEL_NAME
+    )
+    assert [name for name, _ in layer] == [
+        "language_model.backbone.layers.2.mixer.gate.e_score_correction_bias"
+    ]
+
+    # The text model must not grow the prefix, and the default keeps it off so
+    # every existing caller is unchanged.
+    text = convert_nemotron_h_to_hf(
+        _NEMOTRON_ARGS, "module.module.decoder.layers.2.mlp.router.expert_bias", torch.randn(4)
+    )
+    assert [name for name, _ in text] == ["backbone.layers.2.mixer.gate.e_score_correction_bias"]
+
+
+@pytest.mark.unit
+def test_nemotron_vl_vision_round_trips(nemotron_h_loader_without_tp_guard):
+    """The vision half, through the same shared tables the loader reads."""
+    cases = [
+        ("vision_model.embeddings.cls_register_token", (1, 1, 6)),
+        ("vision_model.embeddings.patch_projection.weight", (6, 3)),
+        ("vision_projector.mlp1.norm.weight", (6,)),
+        ("vision_projector.mlp1.linear1.weight", (4, 6)),
+        ("vision_model.encoder.layer.0.norm1.weight", (6,)),
+        ("vision_model.encoder.layer.0.mlp.fc1.weight", (12, 6)),
+        ("vision_model.encoder.layer.0.attention.output.dense.weight", (6, 6)),
+    ]
+    for name, shape in cases:
+        parameter = torch.arange(torch.tensor(shape).prod()).reshape(shape)
+        hf_tensors = dict(convert_nemotron_h_to_hf(_NEMOTRON_ARGS, name, parameter, _VL_MODEL_NAME))
+        assert hf_tensors, f"{name} exported nothing"
+        loaded = nemotron_h_loader_without_tp_guard(name, Reader(**hf_tensors), _NEMOTRON_VL_CONFIG)
+        assert torch.equal(loaded, parameter), name
+
+
+@pytest.mark.unit
+def test_nemotron_vl_fuses_vision_qkv_and_skips_what_the_checkpoint_lacks():
+    """q/k/v are three Megatron parameters and one HF tensor.
+
+    `convert_to_hf` sees one parameter at a time, so the first two return
+    nothing and the third emits the fused tensor. RADIO is plain MHA, so the
+    fusion is a plain cat in q, k, v order -- the inverse of the loader's
+    `fused.chunk(3, dim=0)`.
+    """
+    q = torch.full((6, 6), 1.0)
+    k = torch.full((6, 6), 2.0)
+    v = torch.full((6, 6), 3.0)
+
+    base = "vision_model.encoder.layer.1.attention.attention"
+    assert convert_nemotron_h_to_hf(_NEMOTRON_ARGS, f"{base}.query.weight", q, _VL_MODEL_NAME) == []
+    assert convert_nemotron_h_to_hf(_NEMOTRON_ARGS, f"{base}.key.weight", k, _VL_MODEL_NAME) == []
+    fused = convert_nemotron_h_to_hf(_NEMOTRON_ARGS, f"{base}.value.weight", v, _VL_MODEL_NAME)
+
+    assert [name for name, _ in fused] == ["vision_model.radio_model.model.blocks.1.attn.qkv.weight"]
+    assert torch.equal(fused[0][1], torch.cat([q, k, v], dim=0))
+
+    # Two parameters exist in the module tree and in no checkpoint: a
+    # config-derived buffer and an identity LayerScale. Both are frozen
+    # (nemotron_35_super_vl.py calls vision_model.requires_grad_(False)), so
+    # exporting nothing is exact rather than approximate.
+    assert convert_nemotron_h_to_hf(_NEMOTRON_ARGS, "vision_model.summary_idxs", torch.tensor([0, 1]), _VL_MODEL_NAME) == []
+    assert (
+        convert_nemotron_h_to_hf(
+            _NEMOTRON_ARGS, "vision_model.encoder.layer.1.layer_scale1.lambda1", torch.ones(6), _VL_MODEL_NAME
+        )
+        == []
+    )

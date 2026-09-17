@@ -51,9 +51,51 @@ import re
 import torch
 
 from slime.backends.megatron_utils.hf_to_megatron.common import strip_mcore_wrappers
-from slime.backends.megatron_utils.hf_to_megatron.nemotron_h import EXPERT_HF, EXPERT_RE, PER_LAYER, TOP_LEVEL
+from slime.backends.megatron_utils.hf_to_megatron.nemotron_h import (
+    _RADIO_PREFIX,
+    _VISION_LAYER_RE,
+    _VISION_LAYER_SCALE_RE,
+    _VISION_PER_LAYER,
+    _VISION_QKV_CHUNK,
+    _VISION_QKV_RE,
+    _VISION_TOP_LEVEL,
+    EXPERT_HF,
+    EXPERT_RE,
+    PER_LAYER,
+    TOP_LEVEL,
+)
 
 _LAYER_RE = re.compile(r"decoder\.layers\.(\d+)\.(.+)")
+
+# Where the language tensors live in the checkpoint, and the mirror of the
+# loader's `_hf_prefix`. Nemotron-3 is a bare causal LM and its tensors sit at
+# the root; 3.5 Super VL wraps the identical tower under `language_model.`.
+#
+# This is not cosmetic. SGLang's NemotronH_Nano_VL_V2.load_weights sorts every
+# incoming tensor by prefix -- `language_model` / `mlp1` /
+# `vision_model.radio_model.` / `sound` -- and has **no else branch**. An
+# unprefixed `backbone.layers.0...` matches none of them and is dropped without
+# a word, so getting this wrong does not raise: it syncs nothing and serves the
+# weights the engine loaded at startup, forever.
+_VL_LANGUAGE_PREFIX = "language_model."
+
+
+def _is_vl(model_name: str) -> bool:
+    """True for Nemotron 3.5 Super VL, false for the text Nemotron-3.
+
+    `_convert_to_hf_core` has already lowercased the name and stripped `_`/`-`,
+    so both the config class (`NemotronH_Omni_Reasoning_V3_Config`) and an
+    explicit `--model-name nemotron_h_omni` normalise to something containing
+    `omni`, while `NemotronHConfig` / `nemotron_h` do not.
+    """
+    return "omni" in model_name
+
+
+# The three Megatron parameters that fuse into one HF tensor, held until the
+# last of them arrives. `convert_to_hf` is called one parameter at a time, so a
+# many-to-one mapping has nowhere else to live; `megatron_to_hf/__init__.py`
+# already does the same thing for DeepSeek's q_a_proj / kv_a_proj pair.
+_vision_qkv_buffer: dict[str, dict[str, torch.Tensor]] = {}
 
 
 def _split_qkv(args, param: torch.Tensor) -> list[torch.Tensor]:
@@ -69,12 +111,89 @@ def _split_qkv(args, param: torch.Tensor) -> list[torch.Tensor]:
     return [t.reshape(-1, *param.shape[1:]).contiguous() for t in (q, k, v)]
 
 
-def convert_nemotron_h_to_hf(args, name, param):
-    """Convert one Nemotron-3 Megatron parameter to its HuggingFace tensors."""
+def _convert_vision(name: str, param: torch.Tensor):
+    """Convert one Nemotron 3.5 Super VL vision-half parameter.
+
+    The exact inverse of the loader's `_vision_hf_tensor`, reusing its tables
+    rather than restating them, and returning the names the released checkpoint
+    uses -- which is the point: those are the names SGLang already loads at
+    startup, so a sync that reproduces them travels a path that is known to work.
+
+    Two parameters are deliberately NOT exported, and neither is an
+    approximation:
+
+    * `vision_model.summary_idxs` -- a config-derived buffer that the released
+      index does not contain at all. The loader synthesizes it from
+      `vision_config.summary_idxs`; SGLang's RadioModel registers it the same
+      way and has no parameter to receive it.
+    * `layer_scale[12].lambda1` -- also absent from the checkpoint. C-RADIO has
+      no LayerScale, `layerscale_value` is 1.0, and SGLang's radio.py has no
+      such parameter either (`grep layer_scale` finds nothing).
+
+    Both would be a problem if training could move them. It cannot:
+    `slime_plugins/models/nemotron_35_super_vl.py:159` calls
+    `vision_model.requires_grad_(False)`, so the whole vision tower is frozen
+    and every tensor here is byte-identical to what the engine loaded at
+    startup. Exporting it at all is redundant rather than wrong -- kept because
+    a sync that silently omits half a model is exactly the failure this file's
+    docstring warns about, and because the freeze is a property of one plugin
+    line that could change.
+    """
+    if name == "vision_model.summary_idxs":
+        return []
+
+    if name in _VISION_TOP_LEVEL:
+        return [(_VISION_TOP_LEVEL[name], param)]
+
+    layer_match = _VISION_LAYER_RE.fullmatch(name)
+    if not layer_match:
+        raise ValueError(f"Unknown Nemotron 3.5 VL vision parameter: {name}")
+    layer_idx, rest = layer_match.groups()
+    hf_block = f"{_RADIO_PREFIX}.blocks.{layer_idx}"
+
+    if _VISION_LAYER_SCALE_RE.fullmatch(rest):
+        return []
+
+    qkv_match = _VISION_QKV_RE.fullmatch(rest)
+    if qkv_match:
+        which, suffix = qkv_match.groups()
+        slot = _vision_qkv_buffer.setdefault(f"{hf_block}.{suffix}", {})
+        if which in slot:
+            raise ValueError(
+                f"nemotron_h: {name!r} arrived twice before its q/k/v siblings completed a "
+                f"fused tensor (have {sorted(slot)}). The buffer assumes one pass over the "
+                "parameters per sync; something is iterating them more than once."
+            )
+        slot[which] = param
+        if len(slot) < 3:
+            return []
+        # HF fuses in q, k, v order and RADIO is plain MHA -- 16 heads of 80, no
+        # grouped-query asymmetry -- so this is a plain cat, the exact inverse of
+        # the loader's `fused.chunk(3, dim=0)[...]`.
+        parts = sorted(slot.items(), key=lambda kv: _VISION_QKV_CHUNK[kv[0]])
+        del _vision_qkv_buffer[f"{hf_block}.{suffix}"]
+        fused = torch.cat([tensor for _, tensor in parts], dim=0)
+        return [(f"{hf_block}.attn.qkv.{suffix}", fused)]
+
+    if rest in _VISION_PER_LAYER:
+        return [(f"{hf_block}.{_VISION_PER_LAYER[rest]}", param)]
+
+    raise ValueError(f"Unknown Nemotron 3.5 VL vision parameter: {name} (block suffix {rest!r})")
+
+
+def convert_nemotron_h_to_hf(args, name, param, model_name=""):
+    """Convert one Nemotron-3 / 3.5 Super VL Megatron parameter to HF tensors."""
     name = strip_mcore_wrappers(name)
 
+    # The vision half exists only on 3.5 Super VL, and its names are unambiguous,
+    # so it is dispatched before anything else -- exactly as the loader does.
+    if name.startswith(("vision_model.", "vision_projector.")):
+        return _convert_vision(name, param)
+
+    prefix = _VL_LANGUAGE_PREFIX if _is_vl(model_name) else ""
+
     if name in TOP_LEVEL:
-        return [(TOP_LEVEL[name], param)]
+        return [(f"{prefix}{TOP_LEVEL[name]}", param)]
 
     if name.startswith("mtp."):
         raise ValueError(
@@ -86,7 +205,7 @@ def convert_nemotron_h_to_hf(args, name, param):
     if not layer_match:
         raise ValueError(f"Unknown parameter name: {name}")
     layer_idx, rest = layer_match.groups()
-    hf_layer = f"backbone.layers.{layer_idx}"
+    hf_layer = f"{prefix}backbone.layers.{layer_idx}"
 
     expert_match = EXPERT_RE.fullmatch(rest)
     if expert_match:
