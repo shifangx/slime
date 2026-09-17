@@ -335,6 +335,12 @@ def test_loader_scope_stays_explicit():
         "mimo",
         "minimax_m2",
         "nemotron_h",
+        # Nemotron 3.5 Super VL, and deliberately the *same* function object as
+        # `nemotron_h` rather than a second loader: its language tower is
+        # Nemotron-3's under a `language_model.` prefix, which that file derives
+        # from the config it is handed. tests/test_nemotron_35_super_vl.py pins
+        # the identity.
+        "nemotron_h_omni",
         "qwen2",
         "qwen2_moe",
         "qwen3",
