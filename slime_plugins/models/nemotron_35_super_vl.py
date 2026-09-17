@@ -59,7 +59,73 @@ from .nemotron_h import get_nemotron_h_spec
 # rather than copied so a fix to the packing arithmetic reaches both models.
 from .qwen3_5_vl_utils import gather_packed_input_ids, get_packed_cp_local_indices
 
-__all__ = ["NemotronOmniVLModel", "get_nemotron_35_super_vl_model_provider", "project_images"]
+__all__ = [
+    "NemotronOmniVLModel",
+    "get_nemotron_35_super_vl_model_provider",
+    "per_image_feature_counts",
+    "project_images",
+]
+
+
+def _attribute_mismatch(pixel_values, vision_model, num_tokens) -> str:
+    """Turn a batch-total mismatch into the image that caused it.
+
+    The batch total is nearly useless on its own: job 18825573 reported 535
+    against 534 and that is all anyone learned -- one token short, somewhere
+    among a micro-batch's images, with no way to tell which or by how much each.
+    A delta of +1 and -1 on two different images looks identical to a clean 0.
+
+    The processor is the authority here and already publishes its answer per
+    image, in `num_tokens`, which this model otherwise ignores and recomputes.
+    Lining the two lists up costs nothing at failure time and names the image.
+    """
+    try:
+        model_counts = per_image_feature_counts(pixel_values, vision_model)
+    except Exception as exc:  # noqa: BLE001 -- diagnostics must not mask the real error
+        return f" (could not attribute per image: {type(exc).__name__}: {exc})"
+
+    if num_tokens is None:
+        return (
+            f" -- model produces {model_counts} per image; the processor's `num_tokens` was not "
+            "forwarded, so there is nothing to compare it against"
+        )
+
+    promised = list(num_tokens)
+    if len(promised) != len(model_counts):
+        return (
+            f" -- {len(promised)} images according to the processor's `num_tokens` but "
+            f"{len(model_counts)} pixel_values entries reached the model; the micro-batch join "
+            "dropped or duplicated an image rather than miscounting one"
+        )
+
+    offenders = [
+        (i, want, got) for i, (want, got) in enumerate(zip(promised, model_counts)) if want != got
+    ]
+    if not offenders:
+        return (
+            f" -- every image agrees with the processor ({sum(promised)} tokens over "
+            f"{len(promised)} images), so the extra placeholders are not an image's: look at the "
+            "packed sequence, not the vision tower"
+        )
+    detail = ", ".join(f"image {i}: processor {want} vs model {got}" for i, want, got in offenders)
+    return f" -- {len(offenders)} of {len(promised)} images disagree ({detail})"
+
+
+def per_image_feature_counts(pixel_values, vision_model) -> list[int]:
+    """How many features each image will project to, without projecting it.
+
+    The same arithmetic `NemotronH_Omni_Reasoning_V3VisionProjector.forward` does
+    -- grid from `pixel_values.shape`, then the 2x2 pixel shuffle -- reproduced
+    here only so a mismatch can be attributed to one image instead of to a batch
+    total. `int(h * 0.5)` is the projector's own spelling and is kept: it floors,
+    where the processor's `(wp * hp) // 4` does not, and those two disagree the
+    moment a grid dimension is odd.
+    """
+    patch = vision_model.patch_size
+    # A bare `(3, H, W)` is one image; a `(N, 3, H, W)` stack and a list both
+    # iterate to per-image entries.
+    images = [pixel_values] if isinstance(pixel_values, torch.Tensor) and pixel_values.dim() == 3 else pixel_values
+    return [(image.shape[-2] // patch // 2) * (image.shape[-1] // patch // 2) for image in images]
 
 
 def project_images(pixel_values, vision_model, vision_projector) -> torch.Tensor:
@@ -236,6 +302,7 @@ class NemotronOmniVLModel(MegatronModule):
         cu_seqlens: torch.Tensor,
         cp_group,
         pixel_values,
+        num_tokens=None,
     ) -> torch.Tensor:
         embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None).clone()
         embeddings_bsh = embeddings.transpose(0, 1).contiguous()
@@ -261,6 +328,7 @@ class NemotronOmniVLModel(MegatronModule):
                     f"Nemotron 3.5 VL token/features mismatch: "
                     f"{full_vision_positions.numel()} <image> placeholders, "
                     f"{vision_embeddings.shape[0]} projected features"
+                    + _attribute_mismatch(pixel_values, self.vision_model, num_tokens)
                 )
 
             feature_indices = torch.full(
@@ -295,6 +363,10 @@ class NemotronOmniVLModel(MegatronModule):
         # do not fall into **kwargs and get passed down to MambaModel, which
         # would raise on the first microbatch.
         num_patches=None,
+        # Forwarded into the injection path now, where it is the processor's own
+        # per-image answer and the only thing that can say *which* image is short
+        # when the totals disagree. Still not used to size anything -- the
+        # projector reads the grid off `pixel_values.shape` as before.
         num_tokens=None,
         pixel_values_videos=None,
         sound_clips=None,
@@ -319,6 +391,7 @@ class NemotronOmniVLModel(MegatronModule):
                 packed_seq_params.cu_seqlens_q,
                 cp_group,
                 pixel_values,
+                num_tokens,
             )
 
         # position_ids stays whatever it was -- NoPE, so MambaModel's embedding
