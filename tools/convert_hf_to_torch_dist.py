@@ -1,5 +1,7 @@
+import argparse
 import gc
 import os
+import pickle
 import shutil
 
 import torch
@@ -78,6 +80,41 @@ def get_args():
     return args
 
 
+def save_common_state(args, checkpoint_dir):
+    """Write `common.pt` next to the shards.
+
+    megatron's `torch_dist` save does not produce one -- no checkpoint in this
+    tree has it, converted or trained, only `.metadata` / `metadata.json` /
+    `__N_M.distcp` -- but slime's own `tools/convert_torch_dist_to_hf.py` opens
+    `<iteration>/common.pt` and reads `["args"]` from it unconditionally. So
+    without this file the exporter cannot read the checkpoint the importer just
+    wrote, which is how a 227 GB artifact ends up being unreadable by the tool
+    written to consume it.
+
+    What the readers actually want out of it is small -- `num_layers`,
+    `num_experts`, `vocab_size`, `hidden_size`, `kv_channels`,
+    `num_attention_heads`, `num_query_groups`, `q_lora_rank` -- but the whole
+    namespace is stored, because the next consumer will want a different field
+    and guessing which is how this file came to be missing in the first place.
+
+    Attributes that do not pickle are dropped and named rather than failing the
+    job: the checkpoint is already on disk by the time this runs, and an hour of
+    conversion should not be lost to one un-serializable flag.
+    """
+    keep, dropped = {}, []
+    for key, value in vars(args).items():
+        try:
+            pickle.dumps(value)
+        except Exception:  # noqa: BLE001 -- the reason does not change what we do
+            dropped.append(key)
+        else:
+            keep[key] = value
+
+    path = os.path.join(checkpoint_dir, "common.pt")
+    torch.save({"args": argparse.Namespace(**keep)}, path)
+    print(f"wrote {path}" + (f" (dropped {len(dropped)} unpicklable: {sorted(dropped)})" if dropped else ""))
+
+
 def main():
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
@@ -138,6 +175,7 @@ def main():
         source_dir = get_checkpoint_name(args.save, 1, False, return_base_dir=True)
         target_dir = get_checkpoint_name(args.save, -1, True, return_base_dir=True)
         shutil.move(source_dir, target_dir)
+        save_common_state(args, target_dir)
     dist.barrier()
     dist.destroy_process_group()
 
