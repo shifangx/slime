@@ -97,8 +97,59 @@ def get_layer_param(args, name, param):
         yield from get_expert_param(args, name, param)
 
 
-def get_named_params(args, state_dict):
+# Megatron's dist-checkpoint stores the Mamba mixers' packed tensors as one
+# entry per *component*, named by it -- `mixer.in_proj.weight.z`,
+# `...weight.x`, `.B`, `.C`, `.dt` -- where the model itself holds a single
+# packed tensor. Nothing downstream knows those names: `convert_to_hf` is
+# written against the packed spelling, so without this every Mamba parameter of
+# a torch_dist checkpoint raises `Unknown parameter name`. On the RL weight-sync
+# path the question never arises, because there the tensors come from a live
+# model and `update_weight/common.py::merge_tp_partitions` has already
+# reassembled them.
+#
+# The order is the one that function documents and that
+# `megatron_to_hf/nemotron_h.py` repeats: `in_proj` is `[z, x, B, C, dt]` and
+# `conv1d` is `[x, B, C]`. It is not taken on faith -- a wrong order changes the
+# tensor, and `tools/diff_torch_dist_vs_hf.py` compares against the HF
+# checkpoint elementwise, so it would surface as a mismatch rather than as
+# silent garbage.
+MAMBA_PACKED_COMPONENTS = {
+    "in_proj.weight": ("z", "x", "B", "C", "dt"),
+    "conv1d.weight": ("x", "B", "C"),
+    "conv1d.bias": ("x", "B", "C"),
+}
+
+
+def merge_mamba_components(state_dict):
+    """Concatenate per-component Mamba entries back into their packed tensors."""
+    merged = {}
+    groups = {}
     for name, param in state_dict.items():
+        base, _, component = name.rpartition(".")
+        packed = next((p for p in MAMBA_PACKED_COMPONENTS if base.endswith(p)), None)
+        if packed is None or component not in MAMBA_PACKED_COMPONENTS[packed]:
+            merged[name] = param
+        else:
+            groups.setdefault((base, packed), {})[component] = param
+
+    for (base, packed), parts in groups.items():
+        order = MAMBA_PACKED_COMPONENTS[packed]
+        missing = [component for component in order if component not in parts]
+        extra = [component for component in parts if component not in order]
+        if missing or extra:
+            raise ValueError(
+                f"{base}: cannot reassemble the packed Mamba tensor -- "
+                f"missing {missing}, unexpected {extra}; expected exactly {list(order)}"
+            )
+        merged[base] = torch.cat([parts[component] for component in order], dim=0)
+
+    if groups:
+        print(f"reassembled {len(groups)} packed Mamba tensors from {sum(len(p) for p in groups.values())} components")
+    return merged
+
+
+def get_named_params(args, state_dict):
+    for name, param in merge_mamba_components(state_dict).items():
         name = f"module.module.{name}"
         yield from get_layer_param(args, name, param)
 
