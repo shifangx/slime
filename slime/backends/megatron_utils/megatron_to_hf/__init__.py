@@ -4,6 +4,7 @@ from .glm4moe import convert_glm4moe_to_hf
 from .llama import convert_llama_to_hf
 from .mimo import convert_mimo_to_hf
 from .minimax_m2 import convert_minimax_m2_to_hf
+from .nemotron_h import convert_nemotron_h_to_hf
 from .processors import quantize_params, remove_padding
 from .qwen2 import convert_qwen2_to_hf
 from .qwen3_5 import convert_qwen3_5_to_hf
@@ -35,6 +36,10 @@ def _convert_to_hf_core(args, model_name, name, param):
     model_name = model_name.lower().replace("_", "").replace("-", "")
     if "minimaxm2" in model_name:
         converted_named_tensors = convert_minimax_m2_to_hf(args, name, param)
+    # `NemotronHConfig` normalises to "nemotronhconfig"; the HF model_type spelling
+    # `nemotron_h` normalises to the same "nemotronh" for an explicit --model-name.
+    elif "nemotronh" in model_name:
+        converted_named_tensors = convert_nemotron_h_to_hf(args, name, param)
     elif any(family in model_name for family in ("glm4moelite", "deepseekv3", "deepseekv32", "glmmoedsa", "kimi")):
         converted_named_tensors = convert_deepseekv3_to_hf(args, name, param)
     elif "glm4moe" in model_name:

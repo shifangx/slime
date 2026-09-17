@@ -20,6 +20,7 @@ if not _has_megatron:
     sys.modules["slime.backends.megatron_utils"] = _megatron_utils
 
 from slime.backends.megatron_utils.hf_to_megatron import _LOADERS
+from slime.backends.megatron_utils.hf_to_megatron import nemotron_h as nemotron_h_loader
 from slime.backends.megatron_utils.hf_to_megatron.common import SafetensorReader
 from slime.backends.megatron_utils.hf_to_megatron.deepseek import deepseek_hf_tensor
 from slime.backends.megatron_utils.hf_to_megatron.glm import glm4_hf_tensor, glm4_moe_hf_tensor
@@ -36,6 +37,7 @@ from slime.backends.megatron_utils.megatron_to_hf.glm4 import convert_glm4_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.glm4moe import convert_glm4moe_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.mimo import convert_mimo_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.minimax_m2 import convert_minimax_m2_to_hf
+from slime.backends.megatron_utils.megatron_to_hf.nemotron_h import convert_nemotron_h_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.qwen2 import convert_qwen2_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.qwen3_next import convert_qwen3_next_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.qwen3moe import convert_qwen3moe_to_hf
@@ -341,6 +343,204 @@ def test_loader_scope_stays_explicit():
         "qwen3_moe",
         "qwen3_next",
     }
+
+
+# A toy Nemotron-3: hidden 8, 4 attention heads in 2 KV groups of head_dim 2,
+# mamba d_inner 4 with 2 heads and 1 group of state 2, 4 routed experts in a
+# latent space of 3. Same proportions as the 120B checkpoint, small enough to
+# write shapes down.
+_NEMOTRON_ARGS = types.SimpleNamespace(
+    kv_channels=2,
+    hidden_size=8,
+    num_attention_heads=4,
+    num_query_groups=2,
+    num_layers=3,
+    q_lora_rank=None,
+)
+
+_NEMOTRON_CONFIG = types.SimpleNamespace(
+    model_type="nemotron_h",
+    hidden_size=8,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=2,
+    num_hidden_layers=3,
+    tie_word_embeddings=False,
+)
+
+# Every parameter the hybrid stack creates, one per name the model actually asks
+# for: layer 0 Mamba-2, layer 1 attention, layer 2 latent MoE. The shapes are the
+# real ones for the toy config -- in_proj packs [z(4) x(4) B(2) C(2) dt(2)] and
+# conv1d packs [x(4) B(2) C(2)].
+_NEMOTRON_PARAMETERS = [
+    ("embedding.word_embeddings.weight", (16, 8)),
+    ("decoder.final_norm.weight", (8,)),
+    ("output_layer.weight", (16, 8)),
+    ("decoder.layers.0.mixer.in_proj.layer_norm_weight", (8,)),
+    ("decoder.layers.0.mixer.in_proj.weight", (14, 8)),
+    ("decoder.layers.0.mixer.conv1d_weight", (8, 1, 4)),
+    ("decoder.layers.0.mixer.conv1d_bias", (8,)),
+    ("decoder.layers.0.mixer.A_log", (2,)),
+    ("decoder.layers.0.mixer.D", (2,)),
+    ("decoder.layers.0.mixer.dt_bias", (2,)),
+    ("decoder.layers.0.mixer.norm.weight", (4,)),
+    ("decoder.layers.0.mixer.out_proj.weight", (8, 4)),
+    ("decoder.layers.1.self_attention.linear_qkv.layer_norm_weight", (8,)),
+    ("decoder.layers.1.self_attention.linear_qkv.weight", (16, 8)),
+    ("decoder.layers.1.self_attention.linear_proj.weight", (8, 8)),
+    ("decoder.layers.2.pre_mlp_layernorm.weight", (8,)),
+    ("decoder.layers.2.mlp.router.weight", (4, 8)),
+    ("decoder.layers.2.mlp.router.expert_bias", (4,)),
+    ("decoder.layers.2.mlp.fc1_latent_proj.weight", (3, 8)),
+    ("decoder.layers.2.mlp.fc2_latent_proj.weight", (8, 3)),
+    ("decoder.layers.2.mlp.shared_experts.linear_fc1.weight", (6, 8)),
+    ("decoder.layers.2.mlp.shared_experts.linear_fc2.weight", (8, 6)),
+    ("decoder.layers.2.mlp.experts.linear_fc1.weight3", (5, 3)),
+    ("decoder.layers.2.mlp.experts.linear_fc2.weight3", (3, 5)),
+]
+
+
+@pytest.fixture
+def nemotron_h_loader_without_tp_guard(monkeypatch):
+    """The loader refuses TP > 1 by asking megatron's mpu, which CPU CI has no copy of."""
+    monkeypatch.setattr(nemotron_h_loader, "_assert_no_tensor_parallel", lambda: None)
+    return nemotron_h_loader.nemotron_h_hf_tensor
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("suffix", "shape"), _NEMOTRON_PARAMETERS, ids=[name for name, _ in _NEMOTRON_PARAMETERS])
+def test_nemotron_h_round_trips_every_parameter(nemotron_h_loader_without_tp_guard, suffix, shape):
+    name = f"module.module.{suffix}"
+    parameter = torch.arange(torch.tensor(shape).prod()).reshape(shape)
+
+    hf_tensors = dict(convert_nemotron_h_to_hf(_NEMOTRON_ARGS, name, parameter))
+    loaded = nemotron_h_loader_without_tp_guard(name, Reader(**hf_tensors), _NEMOTRON_CONFIG)
+
+    assert torch.equal(loaded, parameter)
+
+
+@pytest.mark.unit
+def test_nemotron_h_exports_the_names_the_hf_checkpoint_uses():
+    # The three that are not a rename of the Megatron name, spelled out so a
+    # typo in the shared map is a failing test rather than a silent weight sync.
+    qkv = dict(
+        convert_nemotron_h_to_hf(
+            _NEMOTRON_ARGS,
+            "module.module.decoder.layers.1.self_attention.linear_qkv.weight",
+            torch.arange(16 * 8).reshape(16, 8),
+        )
+    )
+    assert list(qkv) == [
+        "backbone.layers.1.mixer.q_proj.weight",
+        "backbone.layers.1.mixer.k_proj.weight",
+        "backbone.layers.1.mixer.v_proj.weight",
+    ]
+    # Group 0 is rows 0..7 of the fused tensor: 4 q rows, then k, then v.
+    assert torch.equal(qkv["backbone.layers.1.mixer.q_proj.weight"][:4], torch.arange(32).reshape(4, 8))
+    assert torch.equal(qkv["backbone.layers.1.mixer.k_proj.weight"][:2], torch.arange(32, 48).reshape(2, 8))
+
+    # Squared-ReLU experts: linear_fc1 is up_proj alone, with no gate half to split.
+    expert = convert_nemotron_h_to_hf(
+        _NEMOTRON_ARGS,
+        "module.module.decoder.layers.2.mlp.experts.linear_fc1.weight3",
+        torch.randn(5, 3),
+    )
+    assert [name for name, _ in expert] == ["backbone.layers.2.mixer.experts.3.up_proj.weight"]
+
+    router = convert_nemotron_h_to_hf(
+        _NEMOTRON_ARGS, "module.module.decoder.layers.2.mlp.router.expert_bias", torch.randn(4)
+    )
+    assert [name for name, _ in router] == ["backbone.layers.2.mixer.gate.e_score_correction_bias"]
+
+
+@pytest.mark.unit
+def test_nemotron_h_weight_sync_reaches_the_exporter():
+    # What the RL path actually passes: model_name is type(hf_config).__name__.lower(),
+    # i.e. "nemotronhconfig". Without this branch every rollout's update_weights
+    # raises ValueError: Unsupported model.
+    parameter = torch.randn(8, 8)
+
+    converted = _convert_to_hf_core(
+        _NEMOTRON_ARGS,
+        "nemotronhconfig",
+        "module.module.decoder.layers.1.self_attention.linear_proj.weight",
+        parameter,
+    )
+
+    assert converted == [("backbone.layers.1.mixer.o_proj.weight", parameter)]
+
+
+@pytest.mark.unit
+def test_nemotron_h_refuses_to_export_an_mtp_block():
+    # The released checkpoint has one and this stack does not build it; a name
+    # from one that did would otherwise fall through to the layer regex.
+    with pytest.raises(ValueError, match="no MTP block"):
+        convert_nemotron_h_to_hf(_NEMOTRON_ARGS, "module.module.mtp.layers.0.enorm.weight", torch.randn(8))
+
+
+def _update_weight_common():
+    """``update_weight/common.py``, importable without megatron (CPU CI)."""
+    name = "slime.backends.megatron_utils.update_weight.common"
+    if name in sys.modules:
+        return sys.modules[name]
+    if not _has_megatron:
+        megatron = types.ModuleType("megatron")
+        core = types.ModuleType("megatron.core")
+        core.mpu = types.ModuleType("megatron.core.mpu")
+        transformer_layer = types.ModuleType("megatron.core.transformer.transformer_layer")
+        transformer_layer.get_transformer_layer_offset = lambda *args, **kwargs: 0
+        for module_name, module in {
+            "megatron": megatron,
+            "megatron.core": core,
+            "megatron.core.mpu": core.mpu,
+            "megatron.core.transformer": types.ModuleType("megatron.core.transformer"),
+            "megatron.core.transformer.transformer_layer": transformer_layer,
+        }.items():
+            sys.modules.setdefault(module_name, module)
+    return importlib.import_module(name)
+
+
+@pytest.mark.unit
+def test_ungated_linear_fc1_is_a_plain_concat_across_tp():
+    # Nemotron's experts are squared-ReLU: linear_fc1 is up_proj alone. Splitting
+    # each rank's shard in half and reordering -- what a gated model needs -- would
+    # interleave garbage here.
+    common = _update_weight_common()
+    ungated = types.SimpleNamespace(swiglu=False, squared_relu=True)
+    partitions = [torch.arange(8).reshape(4, 2), torch.arange(8, 16).reshape(4, 2)]
+
+    merged = common.merge_tp_partitions(ungated, "mlp.experts.linear_fc1.weight0", partitions, 0)
+
+    assert torch.equal(merged, torch.arange(16).reshape(8, 2))
+
+
+@pytest.mark.unit
+def test_gated_linear_fc1_still_degroups_gate_and_up():
+    common = _update_weight_common()
+    gated = types.SimpleNamespace(swiglu=True)
+    # Each rank holds [gate_r; up_r]; the full tensor is [gate_0, gate_1, up_0, up_1].
+    partitions = [torch.tensor([[0.0], [10.0]]), torch.tensor([[1.0], [11.0]])]
+
+    merged = common.merge_tp_partitions(gated, "mlp.linear_fc1.weight", partitions, 0)
+
+    assert torch.equal(merged, torch.tensor([[0.0], [1.0], [10.0], [11.0]]))
+
+
+@pytest.mark.unit
+def test_partition_sizes_reassemble_the_mamba_in_proj():
+    # in_proj packs [z, x, B, C, dt] and every TP rank holds a slice of each, so
+    # the gathered tensor has to be regrouped by component. Two ranks, one row of
+    # z/x and two of dt each.
+    common = _update_weight_common()
+    args = types.SimpleNamespace(swiglu=False)
+    partitions = [
+        torch.tensor([[0.0], [1.0], [2.0], [3.0]]),
+        torch.tensor([[4.0], [5.0], [6.0], [7.0]]),
+    ]
+
+    merged = common.merge_tp_partitions(args, "mixer.in_proj.weight", partitions, 0, [1, 1, 2])
+
+    assert torch.equal(merged, torch.tensor([[0.0], [4.0], [1.0], [5.0], [2.0], [3.0], [6.0], [7.0]]))
 
 
 @pytest.mark.unit

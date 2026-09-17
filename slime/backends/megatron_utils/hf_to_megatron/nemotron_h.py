@@ -56,7 +56,6 @@ correctly, because ``MambaMixer`` and the MoE modules implement
 Nemotron-3 Super is 42,683 separate tensors.
 """
 
-
 from __future__ import annotations
 
 import re
@@ -65,9 +64,14 @@ import torch
 
 from slime.backends.megatron_utils.hf_to_megatron.common import SafetensorReader, merge_qkv, strip_mcore_wrappers
 
+# The four tables below are public because `megatron_to_hf/nemotron_h.py` -- the
+# export direction RL needs -- reads them instead of keeping a second copy. Both
+# directions key on the Megatron name and want the HF name, so there is nothing
+# to invert, and one table cannot drift from the other.
+
 # Megatron name (after wrapper stripping) -> HF name, for the handful of
 # parameters that live outside a layer.
-_TOP_LEVEL = {
+TOP_LEVEL = {
     "embedding.word_embeddings.weight": "backbone.embeddings.weight",
     # MambaStack names its trailing norm `final_norm` (ssm/mamba_block.py:166);
     # `final_layernorm` is the GPTModel spelling and is accepted so a future
@@ -81,7 +85,7 @@ _TOP_LEVEL = {
 # `{i}` is filled in by the caller. Ordered by layer type for readability; the
 # lookup is a single dict because the layer type is implied by which names the
 # model actually asks for.
-_PER_LAYER = {
+PER_LAYER = {
     # -- Mamba-2 mixer ------------------------------------------------------
     "mixer.A_log": "mixer.A_log",
     "mixer.D": "mixer.D",
@@ -126,8 +130,8 @@ _PER_LAYER = {
 # TEGroupedMLP stores the routed experts as `...linear_fc1.weight{global_index}`;
 # slime's named_params_and_buffers() has already added the expert-parallel
 # offset, so the index here is the global one and indexes HF directly.
-_EXPERT_RE = re.compile(r"mlp\.experts\.linear_fc(1|2)\.weight(\d+)")
-_EXPERT_HF = {"1": "up_proj", "2": "down_proj"}
+EXPERT_RE = re.compile(r"mlp\.experts\.linear_fc(1|2)\.weight(\d+)")
+EXPERT_HF = {"1": "up_proj", "2": "down_proj"}
 
 
 def _assert_no_tensor_parallel() -> None:
@@ -151,8 +155,8 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
 
     name = strip_mcore_wrappers(name)
 
-    if name in _TOP_LEVEL:
-        return reader.get_tensor(_TOP_LEVEL[name])
+    if name in TOP_LEVEL:
+        return reader.get_tensor(TOP_LEVEL[name])
 
     layer_match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
     if not layer_match:
@@ -160,10 +164,10 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
     layer_idx, rest = layer_match.groups()
     hf_layer = f"backbone.layers.{layer_idx}"
 
-    expert_match = _EXPERT_RE.fullmatch(rest)
+    expert_match = EXPERT_RE.fullmatch(rest)
     if expert_match:
         which, expert_idx = expert_match.groups()
-        return reader.get_tensor(f"{hf_layer}.mixer.experts.{expert_idx}.{_EXPERT_HF[which]}.weight")
+        return reader.get_tensor(f"{hf_layer}.mixer.experts.{expert_idx}.{EXPERT_HF[which]}.weight")
 
     # The only transform. HF keeps q/k/v apart; Megatron wants one interleaved
     # [q k v] per KV group. merge_qkv reads num_key_value_heads / head_dim off
@@ -180,7 +184,7 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
             hf_config,
         )
 
-    if rest in _PER_LAYER:
-        return reader.get_tensor(f"{hf_layer}.{_PER_LAYER[rest]}")
+    if rest in PER_LAYER:
+        return reader.get_tensor(f"{hf_layer}.{PER_LAYER[rest]}")
 
     raise KeyError(f"Unsupported Nemotron-3 Megatron parameter {name!r} (layer suffix {rest!r})")
