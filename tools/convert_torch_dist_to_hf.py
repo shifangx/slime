@@ -109,10 +109,11 @@ def get_layer_param(args, name, param):
 #
 # The order is the one that function documents and that
 # `megatron_to_hf/nemotron_h.py` repeats: `in_proj` is `[z, x, B, C, dt]` and
-# `conv1d` is `[x, B, C]`. It is not taken on faith -- a wrong order changes the
-# tensor, and `tools/diff_torch_dist_vs_hf.py` compares against the HF
-# checkpoint elementwise, so it would surface as a mismatch rather than as
-# silent garbage.
+# `conv1d` is `[x, B, C]`. Getting it wrong is the dangerous failure here --
+# the tensor keeps its shape and changes its contents, so nothing raises. Two
+# independent statements of the order in this codebase agree, and
+# `tests/test_mamba_component_merge.py` pins it, but neither is a measurement
+# against the weights: an exported checkpoint that serves like the original is.
 MAMBA_PACKED_COMPONENTS = {
     "in_proj.weight": ("z", "x", "B", "C", "dt"),
     "conv1d.weight": ("x", "B", "C"),
