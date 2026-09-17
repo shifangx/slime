@@ -160,23 +160,19 @@ class Qwen3_5VLModel(MegatronModule):
     ) -> torch.Tensor:
         embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None).clone()
         embeddings_bsh = embeddings.transpose(0, 1).contiguous()
-        # Without CP the local token stream *is* the full packed stream, so the
-        # mapping is the identity and there is nothing to look up. Skipping it
-        # is not just an optimization: get_packed_cp_local_indices() requires
-        # every packed sequence to divide by 2 * cp_size, which at cp_size=1
-        # degenerates into "must be even" and rejects any odd-length packed
-        # sequence -- `ValueError: Packed sequence length 4551 must be divisible
-        # by 2 * CP size 1`, which killed job 18745180 mid-train_one_step.
-        # gather_packed_input_ids() already short-circuits the same way.
-        if cp_group is None or cp_group.size() == 1:
-            local_indices = None
-        else:
-            local_indices = get_packed_cp_local_indices(
-                cu_seqlens,
-                cp_group.size(),
-                cp_group.rank(),
-                input_ids.device,
-            )
+        # The cp_size == 1 case -- where the local stream is the full packed
+        # stream and the mapping is the identity -- is answered inside
+        # get_packed_cp_local_indices() now, not here. It used to be guarded at
+        # this call site, and that is why the bug reached a second model: the
+        # Nemotron 3.5 Super VL port imported the helper to share exactly this
+        # arithmetic and inherited the unguarded version (job 18816200). See
+        # that function's docstring.
+        local_indices = get_packed_cp_local_indices(
+            cu_seqlens,
+            cp_group.size() if cp_group is not None else 1,
+            cp_group.rank() if cp_group is not None else 0,
+            input_ids.device,
+        )
 
         for values, grids, token_id in (
             (pixel_values, image_grid_thw, self.image_token_id),
@@ -202,7 +198,7 @@ class Qwen3_5VLModel(MegatronModule):
                 device=input_ids.device,
             )
             feature_indices[full_vision_positions] = torch.arange(vision_embeddings.shape[0], device=input_ids.device)
-            local_feature_indices = feature_indices if local_indices is None else feature_indices[local_indices]
+            local_feature_indices = feature_indices[local_indices]
             local_vision_mask = local_feature_indices >= 0
             if not torch.equal(local_vision_mask, input_ids[0] == token_id):
                 raise ValueError("Qwen3.5-VL CP token layout does not match its full packed sequence")

@@ -12,9 +12,39 @@ def get_packed_cp_local_indices(
     cp_rank: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Map a THD CP rank's local tokens back to the full packed token stream."""
+    """Map a THD CP rank's local tokens back to the full packed token stream.
+
+    Without context parallelism one rank owns the whole packed stream, so the
+    local view *is* the full stream and the mapping is the identity. That case is
+    answered here rather than left to the zigzag path below, which splits every
+    sequence into ``2 * cp_size`` chunks and therefore requires an even length --
+    at ``cp_size == 1`` that degenerates into "must be even" and rejects roughly
+    half of all real packs.
+
+    **This guard belongs in the helper and not in the callers.** The same
+    ``ValueError`` has killed three separate training runs -- job 18745180, the
+    2026-09-16 hard-reset regression, and job 18816200 (Nemotron 3.5 Super VL,
+    ``Packed sequence length 347 must be divisible by 2 * CP size 1``) -- and the
+    first two were fixed at the Qwen call site, leaving the helper itself intact.
+    So when ``slime_plugins/models/nemotron_35_super_vl.py`` imported this
+    function precisely so that "a fix to the packing arithmetic reaches both
+    models", what it inherited was the bug rather than the fix. One route, one
+    place: every caller, present and future, is now safe by construction.
+
+    It changes no output that was previously produced. At ``cp_size == 1`` with
+    an even length the loop below already computes exactly this range: rank 0
+    takes ``[start, start + len/2)`` and then ``[start + len/2, end)``, and
+    ``cu_seqlens`` is cumulative, so concatenating those over every sequence is
+    ``arange(first_boundary, last_boundary)``. It only stops rejecting inputs
+    that were always valid.
+    """
 
     boundaries = [int(value) for value in cu_seqlens]
+    if cp_size == 1:
+        if len(boundaries) < 2:
+            return torch.empty(0, dtype=torch.long, device=device)
+        return torch.arange(boundaries[0], boundaries[-1], device=device)
+
     indices = []
     for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
         sequence_length = end - start

@@ -79,6 +79,39 @@ def test_thd_cp_indices_select_two_chunks_per_packed_sequence():
 
 
 @pytest.mark.unit
+def test_thd_cp_indices_are_the_identity_without_context_parallelism():
+    """At cp_size 1 one rank owns the whole stream, odd packs included.
+
+    The odd length is the point. The zigzag path splits every sequence into
+    2 * cp_size chunks, so at cp_size 1 it demanded an even length and raised
+    `Packed sequence length N must be divisible by 2 * CP size 1` on roughly
+    half of all real packs -- jobs 18745180 (4551) and 18816200 (347).
+    """
+    cpu = torch.device("cpu")
+
+    assert get_packed_cp_local_indices([0, 347], cp_size=1, cp_rank=0, device=cpu).tolist() == list(range(347))
+    # Several sequences, odd and even mixed, stay in packed order.
+    assert get_packed_cp_local_indices([0, 3, 8], cp_size=1, cp_rank=0, device=cpu).tolist() == list(range(8))
+    # No sequences at all: empty rather than IndexError.
+    assert get_packed_cp_local_indices([], cp_size=1, cp_rank=0, device=cpu).tolist() == []
+    assert get_packed_cp_local_indices([0], cp_size=1, cp_rank=0, device=cpu).tolist() == []
+
+
+@pytest.mark.unit
+def test_thd_cp1_shortcut_matches_what_the_zigzag_path_used_to_return():
+    """The claim the cp_size 1 shortcut rests on, as a test rather than a comment.
+
+    It is only allowed to stop *rejecting* inputs, never to change an answer.
+    For the even lengths the old code accepted, the zigzag arithmetic at
+    cp_size 1 already produced exactly this range.
+    """
+    cpu = torch.device("cpu")
+    for cu_seqlens in ([0, 8], [0, 8, 16], [0, 2, 6, 14]):
+        expected = list(range(int(cu_seqlens[0]), int(cu_seqlens[-1])))
+        assert get_packed_cp_local_indices(cu_seqlens, cp_size=1, cp_rank=0, device=cpu).tolist() == expected
+
+
+@pytest.mark.unit
 def test_raw_qkv_loader_is_inverse_of_exporter():
     hidden_size = 3
     q = torch.arange(16 * hidden_size).reshape(16, hidden_size)
