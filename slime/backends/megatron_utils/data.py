@@ -25,9 +25,45 @@ def _concat_multimodal_field(left, right):
 
     Sequences concatenate, tensors `cat` on dim 0, and anything else is an
     unhandled processor output rather than something to guess at.
+
+    TWO TENSORS ARE NOT ENOUGH TO JUSTIFY A `cat`
+    ---------------------------------------------
+    The processor stacks per *sample*, so it returns a tensor whenever the
+    images within one sample share a size -- and says nothing about the next
+    sample. Two samples that are each internally uniform but differ from each
+    other both arrive as tensors with incompatible trailing shapes, and
+    `torch.cat` on dim 0 raises:
+
+        RuntimeError: Sizes of tensors must match except in dimension 0.
+        Expected size 480 but got size 384 for tensor number 1 in the list.
+
+    That is job 18824653, which got through the weight sync and its first
+    rollout and then died on the first micro-batch of `actor_train`. The two
+    mixed branches below already resolve exactly this collision by degrading to
+    the list form; this branch was the one case that assumed the shapes agreed.
     """
     if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
-        return torch.cat([left, right], dim=0)
+        # Only dim 0 is the join axis, so everything after it has to match for a
+        # `cat` to mean what it says. When it does not, fall back to the list
+        # form -- `project_images` iterates it and projects each image on its
+        # own, which is the whole reason that branch exists.
+        if left.shape[1:] == right.shape[1:]:
+            return torch.cat([left, right], dim=0)
+        # Unbinding dim 0 is the inverse of the stack the processor made, so it
+        # is only right if dim 0 really is the image axis on both sides. Equal
+        # rank is what says so; unequal rank would mean one of them is a bare
+        # `(3, H, W)` single image, and `list()` on that yields `H` tensors of
+        # shape `(W,)` -- garbage the projector would accept without complaint.
+        # Nothing observed produces that, so it is an error rather than a case
+        # to guess at.
+        if left.dim() != right.dim():
+            raise ValueError(
+                f"cannot join multimodal tensors of shapes {tuple(left.shape)} and "
+                f"{tuple(right.shape)} across a micro-batch: the trailing shapes differ, so "
+                "this has to degrade to the per-image list form, but the ranks differ too, so "
+                "which axis is the image axis is ambiguous."
+            )
+        return list(left) + list(right)
     if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
         return list(left) + list(right)
     # One of each: a processor that stacked for one sample and could not for the
