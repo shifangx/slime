@@ -67,6 +67,46 @@ __all__ = [
 ]
 
 
+def _locate_placeholders(full_input_ids, cu_seqlens, image_token_id, num_tokens) -> str:
+    """Say which packed segment the surplus `<image>` tokens are in, and where.
+
+    Reached only when `_attribute_mismatch` has already reported that every
+    image agrees with the processor -- i.e. the surplus is in the sequence, not
+    in the vision tower. Job 18826292 stopped exactly there: 820 placeholders
+    against 814 features over 3 images, every image correct, and no way to tell
+    whether the extra six were six stray tokens in one sample or two in each.
+
+    Per packed segment it reports the placeholder count and the span they
+    occupy, as a fraction of the segment. Placeholders belong to the *prompt*,
+    so they sit at the front; anything in the tail was produced by the model
+    generating the token itself, which is a rollout problem and not a packing
+    one. That distinction is the whole reason for this function -- it is the one
+    question the counts cannot answer.
+    """
+    try:
+        ids = full_input_ids[0]
+        bounds = cu_seqlens.tolist()
+        promised = list(num_tokens) if num_tokens is not None else []
+        lines, consumed = [], 0
+        for seg, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
+            hits = (ids[lo:hi] == image_token_id).nonzero(as_tuple=False).flatten()
+            if hits.numel() == 0:
+                continue
+            want = promised[consumed] if consumed < len(promised) else None
+            consumed += 1
+            first, last = hits[0].item(), hits[-1].item()
+            length = max(hi - lo, 1)
+            lines.append(
+                f"seg {seg} (len {hi - lo}): {hits.numel()} placeholders"
+                + (f", processor promised {want}" if want is not None else "")
+                + f", spanning [{first}, {last}] = {100 * first // length}%-{100 * last // length}% "
+                + ("of the segment -- front, so prompt" if last < length // 2 else "of the segment -- reaches the tail, so the MODEL GENERATED some")
+            )
+        return "\n  " + "\n  ".join(lines) if lines else ""
+    except Exception as exc:  # noqa: BLE001 -- diagnostics must not mask the real error
+        return f"\n  (could not locate placeholders: {type(exc).__name__}: {exc})"
+
+
 def _attribute_mismatch(pixel_values, vision_model, num_tokens) -> str:
     """Turn a batch-total mismatch into the image that caused it.
 
@@ -329,6 +369,7 @@ class NemotronOmniVLModel(MegatronModule):
                     f"{full_vision_positions.numel()} <image> placeholders, "
                     f"{vision_embeddings.shape[0]} projected features"
                     + _attribute_mismatch(pixel_values, self.vision_model, num_tokens)
+                    + _locate_placeholders(full_input_ids, cu_seqlens, self.image_token_id, num_tokens)
                 )
 
             feature_indices = torch.full(
