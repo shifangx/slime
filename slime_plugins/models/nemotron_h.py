@@ -116,6 +116,16 @@ def get_nemotron_h_spec(args, config, vp_stage: int | None = None):
     """
     _assert_supported(args, config, vp_stage)
     pattern = _hybrid_pattern(args)
+    # 0.16 / 0.20. The ratios are the *other* way of describing the stack, for
+    # runs that let Megatron place the layers rather than naming them. 0.20
+    # deleted both CLI flags -- the pattern is the only supported spelling now --
+    # while HybridModel still accepts the keywords, so they are forwarded only
+    # when the parser this megatron.core ships actually produced them. Reading
+    # them unconditionally is what job 18803796 died of, at model construction,
+    # eight ranks in.
+    ratios = {
+        name: getattr(args, name) for name in ("hybrid_attention_ratio", "hybrid_mlp_ratio") if hasattr(args, name)
+    }
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None):
         _assert_no_virtual_pipeline(vp_stage)
@@ -125,12 +135,10 @@ def get_nemotron_h_spec(args, config, vp_stage: int | None = None):
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
-            # Ratios are the *other* way of describing the stack, for runs that
-            # let Megatron place the layers. An explicit pattern wins, and
-            # passing both is only legal when they agree, so these stay at their
-            # argument defaults (0.0) and the pattern decides.
-            hybrid_attention_ratio=args.hybrid_attention_ratio,
-            hybrid_mlp_ratio=args.hybrid_mlp_ratio,
+            # An explicit pattern wins over these, and passing both is only legal
+            # when they agree, so they stay at their argument defaults (0.0)
+            # wherever they still exist and the pattern decides. See above.
+            **ratios,
             # 0.16 / 0.20, see _PATTERN_KWARG. Passing the pattern under the
             # name this megatron.core retired would not raise -- it would build
             # an all-Mamba stack of the right depth and fail much later, on a
