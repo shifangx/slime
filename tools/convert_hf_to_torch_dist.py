@@ -6,6 +6,7 @@ import shutil
 
 import torch
 import torch.distributed as dist
+from megatron.core.dist_checkpointing import load_common_state_dict
 from megatron.core.enums import ModelType
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_tracker_filename, save_checkpoint
@@ -100,6 +101,15 @@ def save_common_state(args, checkpoint_dir):
     Attributes that do not pickle are dropped and named rather than failing the
     job: the checkpoint is already on disk by the time this runs, and an hour of
     conversion should not be lost to one un-serializable flag.
+
+    The file is a *merge* onto what `save_checkpoint` already put in the
+    checkpoint's embedded `common_state`, not a replacement for it. mcore's
+    `load_common_state_dict` short-circuits to `common.pt` whenever that file
+    exists (`dist_checkpointing/serialization.py`, `_legacy_common_state_exists`),
+    so a bare `{"args": ...}` here silently hides every other field the trainer
+    saved -- notably `checkpoint_version`, without which `check_checkpoint_args`
+    takes its pre-3.0 branch and dies looking up the long-removed
+    `model_parallel_size`.
     """
     keep, dropped = {}, []
     for key, value in vars(args).items():
@@ -110,9 +120,26 @@ def save_common_state(args, checkpoint_dir):
         else:
             keep[key] = value
 
+    # Read before writing: once common.pt is on disk it shadows the embedded copy.
+    try:
+        common = load_common_state_dict(checkpoint_dir)
+    except Exception as e:  # noqa: BLE001 -- any failure here means "nothing to merge"
+        print(f"could not read embedded common state ({e}); writing args only")
+        common = {}
+    if not isinstance(common, dict):
+        print(f"unexpected embedded common state of type {type(common)!r}; writing args only")
+        common = {}
+
+    common["args"] = argparse.Namespace(**keep)
+    # save_checkpoint stamps this, but a checkpoint written by an older mcore may not.
+    common.setdefault("checkpoint_version", 3.0)
+
     path = os.path.join(checkpoint_dir, "common.pt")
-    torch.save({"args": argparse.Namespace(**keep)}, path)
-    print(f"wrote {path}" + (f" (dropped {len(dropped)} unpicklable: {sorted(dropped)})" if dropped else ""))
+    torch.save(common, path)
+    print(
+        f"wrote {path} with keys {sorted(common)}"
+        + (f" (dropped {len(dropped)} unpicklable args: {sorted(dropped)})" if dropped else "")
+    )
 
 
 def main():
