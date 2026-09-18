@@ -143,6 +143,54 @@ def _pad_vocab(args, name: str, tensor: torch.Tensor) -> torch.Tensor:
     return F.pad(tensor, (0, 0, 0, padded_size - tensor.shape[0]))
 
 
+def restore_fp32_router_buffers(model) -> int:
+    """Undo ``Float16Module``'s downcast of the router buffers that must stay fp32.
+
+    ``Float16Module`` casts every floating-point parameter AND buffer that is not
+    marked ``keep_in_fp32`` (``transformer/module.py:471-489``), and the MoE
+    router's ``expert_bias`` carries no such mark -- it is registered
+    ``dtype=torch.float32`` and defended afterwards, by
+    ``TopKRouter._maintain_float32_expert_bias()`` called from ``forward``,
+    ``_save_to_state_dict`` and ``_load_from_state_dict``
+    (``moe/router.py:271-280, 864-891``). Megatron's own words for why: "We keep
+    it in float32 to avoid routing errors when updating the expert_bias."
+
+    Those three hooks cover Megatron's own paths. **This loader is a fourth**: it
+    walks ``named_params_and_buffers`` and assigns with ``copy_``, so
+    ``_load_from_state_dict`` never runs and the buffer is still bf16 when the
+    fp32 value lands on it. The value is then rounded on the way in, and
+    ``_save_to_state_dict`` faithfully widens the rounded number back to fp32 on
+    the way out -- an fp32 tensor holding a bf16 value, which no dtype check can
+    see.
+
+    Measured on NVIDIA-Nemotron-3.5-Super (job 18831625 redone at stride 1): 40 of
+    43,078 tensors differed after HF -> torch_dist -> HF, all of them
+    ``e_score_correction_bias``, every element moved, worst
+    ``max |d| 2.295e-01 (rel 3.27e-03)`` -- which is exactly one bf16 ulp at that
+    magnitude, and not a coincidence. It is also the only fp32 tensor in its
+    shard: 679 BF16 against 1 F32.
+
+    Why it is not cosmetic: this bias is added to the router logits to pick
+    experts. Rounding it can flip the top-k for tokens whose scores sit inside
+    the rounding interval, so the converted model routes some tokens to
+    different experts than the source -- a silent behavioural difference, of the
+    kind this directory has been chasing.
+
+    Returns the number of routers restored, so a caller can say so.
+    """
+    restored = 0
+    for chunk in model:
+        for module in chunk.modules():
+            # By capability, not by class or parameter name: a Megatron without
+            # the guard simply has nothing to restore, and a renamed router
+            # still matches.
+            guard = getattr(module, "_maintain_float32_expert_bias", None)
+            if callable(guard):
+                guard()
+                restored += 1
+    return restored
+
+
 def load_model_hf_weights(
     args,
     model,
@@ -151,6 +199,10 @@ def load_model_hf_weights(
     get_hf_tensor: Callable[[str, SafetensorReader, object], torch.Tensor],
 ) -> None:
     from slime.backends.megatron_utils.update_weight.common import named_params_and_buffers
+
+    # Before the loop, not after: the copy below casts to the DESTINATION dtype,
+    # so a buffer that is bf16 at this moment loses the fp32 value permanently.
+    restore_fp32_router_buffers(model)
 
     reader = SafetensorReader(path)
     with torch.no_grad():
