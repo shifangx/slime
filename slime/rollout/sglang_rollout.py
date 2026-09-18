@@ -106,6 +106,11 @@ class GenerateState(metaclass=SingletonMeta):
         if args.rollout_top_p != 1.0:
             self.sampling_params["custom_params"] = {"return_top_p_token_ids": True}
 
+        # Reporting only -- `top_logprobs_num` does not change the draw, it adds
+        # `output_top_logprobs` to meta_info alongside the chosen token's own.
+        if getattr(args, "rollout_top_logprobs_num", 0) > 0:
+            self.sampling_params["top_logprobs_num"] = args.rollout_top_logprobs_num
+
         if getattr(args, "sglang_enable_deterministic_inference", False):
             sampling_seed_base = args.rollout_seed
             self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
@@ -210,6 +215,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
     else:
         new_response_tokens, new_response_log_probs = [], []
+
+    # Truncated here rather than by the consumer: the full thing is 4096
+    # positions x k per sample, which is not something to carry on 512 Samples
+    # through the rest of a rollout just so a hook can throw most of it away.
+    top_logprobs = output["meta_info"].get("output_top_logprobs")
+    if top_logprobs:
+        keep = getattr(args, "rollout_top_logprobs_positions", 0)
+        sample.metadata["output_top_logprobs"] = top_logprobs[:keep] if keep > 0 else top_logprobs
 
     sample.append_response_tokens(
         args,

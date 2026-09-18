@@ -361,6 +361,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--rollout-top-k", type=int, default=-1, help="the top-k for the inference engine during rollout."
             )
+            # Diagnostics, not sampling: these change what the engine REPORTS,
+            # not what it draws. `rollout_log_probs` already carries the chosen
+            # token's own logprob at every step; these two add the alternatives
+            # it was chosen against, which is the difference between knowing a
+            # run picked a different token and knowing whether the distribution
+            # moved or only the draw did.
+            parser.add_argument(
+                "--rollout-top-logprobs-num",
+                type=int,
+                default=0,
+                help=(
+                    "ask the engine for the top-k logprobs at each generated position "
+                    "(SGLang `top_logprobs_num`). 0 disables. Kept on Sample.metadata"
+                    "['output_top_logprobs'], truncated to --rollout-top-logprobs-positions."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-top-logprobs-positions",
+                type=int,
+                default=8,
+                help=(
+                    "how many leading generated positions to keep top-k logprobs for. "
+                    "The full response would be 4096 positions x k per sample; the first "
+                    "few are where a divergence between two runs is diagnosable. "
+                    "0 keeps every position."
+                ),
+            )
             parser.add_argument(
                 "--rollout-max-context-len",
                 type=int,
