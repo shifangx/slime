@@ -98,6 +98,31 @@ def _is_vl(model_name: str) -> bool:
 _vision_qkv_buffer: dict[str, dict[str, torch.Tensor]] = {}
 
 
+def pending_vision_qkv() -> list[str]:
+    """Slots still holding a partial q/k/v. Empty is the only correct end state.
+
+    `_convert_vision` returns ``[]`` for the first two of a block's three qkv
+    parameters and emits the fused tensor on the third. That is right when all
+    three arrive and **silent** when they do not: the ones that did arrive are
+    held here, never returned, never sent. The engine then keeps whatever it
+    loaded at startup for that block's attention while every other block is
+    updated -- a half-synced tower, with nothing in any log to say so.
+
+    The conversion cannot notice that itself. It is called one parameter at a
+    time and has no way to know which one is last. The caller does: when a sync
+    ends, every slot must have been consumed. See
+    `megatron_to_hf.assert_conversion_buffers_drained`.
+
+    Note what this is *not* for, because the buffer already handles it: the slot
+    key is ``f"{hf_block}.{suffix}"`` and `hf_block` carries the layer index, so
+    a `q` from one block can never be fused with a `k` from another. The two
+    failure modes are a slot that never completes -- silent, and what this
+    catches -- and a slot that fills twice, which `_convert_vision` already
+    raises on.
+    """
+    return [f"{key} (have {sorted(slot)})" for key, slot in sorted(_vision_qkv_buffer.items())]
+
+
 def _split_qkv(args, param: torch.Tensor) -> list[torch.Tensor]:
     """Undo the per-KV-group ``[q k v]`` fusion that ``merge_qkv`` applied.
 

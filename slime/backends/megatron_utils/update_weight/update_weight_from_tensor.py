@@ -15,7 +15,7 @@ from slime.utils import accelerator
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
 
-from ..megatron_to_hf import convert_to_hf
+from ..megatron_to_hf import assert_conversion_buffers_drained, convert_to_hf
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .expert_routing import configure_expert_routing
 from .hf_weight_iterator_direct import HfWeightIteratorDirect
@@ -312,6 +312,12 @@ class UpdateWeightFromTensor:
 
         if self._expert_transfer_plan:
             self._update_expert_weights(megatron_local_weights)
+
+        # Every parameter this rank owns has now been through convert_to_hf, so
+        # any converter still holding part of a many-to-one fusion is holding it
+        # forever -- and holding it silently, since an incomplete fusion returns
+        # [] exactly like a parameter that is deliberately not exported.
+        assert_conversion_buffers_drained()
 
         del megatron_local_weights
         dist.barrier(group=get_gloo_group())

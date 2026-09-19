@@ -4,7 +4,7 @@ from .glm4moe import convert_glm4moe_to_hf
 from .llama import convert_llama_to_hf
 from .mimo import convert_mimo_to_hf
 from .minimax_m2 import convert_minimax_m2_to_hf
-from .nemotron_h import convert_nemotron_h_to_hf
+from .nemotron_h import convert_nemotron_h_to_hf, pending_vision_qkv
 from .processors import quantize_params, remove_padding
 from .qwen2 import convert_qwen2_to_hf
 from .qwen3_5 import convert_qwen3_5_to_hf
@@ -25,6 +25,42 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None, trans
     converted_named_tensors = _convert_to_hf_core(args, model_name, name, param)
 
     return quantize_params(args, name, converted_named_tensors, quantization_config, transform_ue8m0)
+
+
+def assert_conversion_buffers_drained(context: str = "end of weight sync") -> None:
+    """Fail loudly if a many-to-one converter is still holding half a tensor.
+
+    Some conversions are many-to-one -- three Megatron parameters becoming one
+    HF tensor -- and `convert_to_hf` sees one parameter at a time, so they buffer
+    the early arrivals and emit on the last one. Every early arrival is returned
+    as ``[]``, which is indistinguishable from "this parameter is deliberately
+    not exported".
+
+    That makes an incomplete buffer silent in the worst way. The tensors that did
+    arrive are never sent, the engine keeps whatever it loaded at startup for
+    that slice of the model, every other slice is updated, and no log line
+    anywhere says a partial model is now being served. `load_weights` cannot
+    catch it either -- it only sees what did arrive.
+
+    A sync ends with every buffer consumed or it did not do what it claimed.
+    Call this once per sync, after the last parameter has gone through.
+
+    Only the Nemotron VL vision buffer is checked. `_cached_tensors` below is the
+    same shape of thing for DeepSeek's q_a_proj/kv_a_proj pair, and is
+    deliberately left out until someone establishes whether it is meant to
+    survive a sync -- its name says cache, and a false alarm here kills a
+    training job.
+    """
+    pending = pending_vision_qkv()
+    if not pending:
+        return
+    raise ValueError(
+        f"nemotron_h: {len(pending)} vision qkv slot(s) still partially filled at {context}: "
+        f"{pending}. Each of these is a RADIO block whose q/k/v did not all arrive in one "
+        "pass, so its fused attention tensor was never emitted and the engine is still "
+        "serving the weights it loaded at startup for that block while the rest of the "
+        "tower was updated. Do not read a reward or an eval score from this run."
+    )
 
 
 # TODO optimize
