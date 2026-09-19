@@ -46,6 +46,7 @@ same subset the loader reads, so a round trip through both is closed.
 
 from __future__ import annotations
 
+import logging
 import re
 
 import torch
@@ -96,6 +97,44 @@ def _is_vl(model_name: str) -> bool:
 # many-to-one mapping has nowhere else to live; `megatron_to_hf/__init__.py`
 # already does the same thing for DeepSeek's q_a_proj / kv_a_proj pair.
 _vision_qkv_buffer: dict[str, dict[str, torch.Tensor]] = {}
+
+
+logger = logging.getLogger(__name__)
+
+
+# The four tensors worth a fingerprint on the way out. The first three are the
+# whole of `patch_generator`, which every patch of every image passes through
+# before block 0, so one of them wrong is a global corruption -- the signature
+# the divergence actually has. The fourth is the one tensor on this path that is
+# assembled rather than copied.
+_VISION_TRACE_SUFFIXES = (
+    "patch_generator.embedder.weight",
+    "patch_generator.pos_embed",
+    "patch_generator.cls_token.token",
+    "blocks.0.attn.qkv.weight",
+)
+
+
+def _trace_vision_emit(named_tensors: list) -> None:
+    """One norm per interesting vision tensor, as it leaves for the engine.
+
+    Half of a two-ended measurement: the engine logs the same four norms after
+    its loader has finished with them (`nano_nemotron_vl`), so the pair says
+    which side of the wire a wrong number is on. Wrong here means the exporter
+    or the Megatron load; right here and wrong there means the engine's loader.
+
+    Cheap enough to leave on -- four `.norm()` calls per sync -- and worth
+    leaving on, because the failure it is aimed at is silent by construction and
+    has already been shipped three times in this path.
+    """
+    for hf_name, tensor in named_tensors:
+        if not hf_name.endswith(_VISION_TRACE_SUFFIXES):
+            continue
+        try:
+            norm = float(tensor.detach().float().norm())
+        except Exception:  # noqa: BLE001 -- a trace must not be why a sync dies
+            continue
+        logger.info("nemotron-vision-trace: emit %s norm=%.6f shape=%s", hf_name, norm, tuple(tensor.shape))
 
 
 def pending_vision_qkv() -> list[str]:
@@ -213,7 +252,9 @@ def convert_nemotron_h_to_hf(args, name, param, model_name=""):
     # The vision half exists only on 3.5 Super VL, and its names are unambiguous,
     # so it is dispatched before anything else -- exactly as the loader does.
     if name.startswith(("vision_model.", "vision_projector.")):
-        return _convert_vision(name, param)
+        converted = _convert_vision(name, param)
+        _trace_vision_emit(converted)
+        return converted
 
     prefix = _VL_LANGUAGE_PREFIX if _is_vl(model_name) else ""
 
