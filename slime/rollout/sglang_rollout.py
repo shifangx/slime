@@ -106,11 +106,6 @@ class GenerateState(metaclass=SingletonMeta):
         if args.rollout_top_p != 1.0:
             self.sampling_params["custom_params"] = {"return_top_p_token_ids": True}
 
-        # Reporting only -- `top_logprobs_num` does not change the draw, it adds
-        # `output_top_logprobs` to meta_info alongside the chosen token's own.
-        if getattr(args, "rollout_top_logprobs_num", 0) > 0:
-            self.sampling_params["top_logprobs_num"] = args.rollout_top_logprobs_num
-
         if getattr(args, "sglang_enable_deterministic_inference", False):
             sampling_seed_base = args.rollout_seed
             self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
@@ -184,6 +179,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+
+    # Reporting only -- `top_logprobs_num` does not change the draw, it adds
+    # `output_top_logprobs` to meta_info alongside the chosen token's own. It is
+    # a field of SGLang's GenerateReqInput, next to `return_logprob`, NOT of
+    # SamplingParams: that struct is kw_only msgspec and rejects it outright, so
+    # putting it in `sampling_params` fails every request with a TypeError.
+    if getattr(args, "rollout_top_logprobs_num", 0) > 0:
+        payload["top_logprobs_num"] = args.rollout_top_logprobs_num
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
