@@ -102,16 +102,20 @@ _vision_qkv_buffer: dict[str, dict[str, torch.Tensor]] = {}
 logger = logging.getLogger(__name__)
 
 
-# The four tensors worth a fingerprint on the way out. The first three are the
+# The five tensors worth a fingerprint on the way out. The first three are the
 # whole of `patch_generator`, which every patch of every image passes through
 # before block 0, so one of them wrong is a global corruption -- the signature
 # the divergence actually has. The fourth is the one tensor on this path that is
-# assembled rather than copied.
+# assembled rather than copied. The fifth was not exported at all until the
+# tower was measured computing nothing, and is here so that a sync which stops
+# carrying it says so in the log instead of in a cosine six documents later.
 _VISION_TRACE_SUFFIXES = (
     "patch_generator.embedder.weight",
     "patch_generator.pos_embed",
     "patch_generator.cls_token.token",
     "blocks.0.attn.qkv.weight",
+    # Added after it was found to be the one tensor the sync did not write.
+    "blocks.0.ls1",
 )
 
 
@@ -175,6 +179,30 @@ def _split_qkv(args, param: torch.Tensor) -> list[torch.Tensor]:
     return [t.reshape(-1, *param.shape[1:]).contiguous() for t in (q, k, v)]
 
 
+def _assert_layer_scale_is_identity(name: str, param: torch.Tensor) -> None:
+    """Warn if a LayerScale tensor leaving for the engine is not all ones.
+
+    Ones is the only value this path can legitimately produce -- the loader
+    synthesizes it from `layerscale_value` and the tower is frozen -- so
+    anything else means one of those two stopped being true. Checked here
+    because this is the one place that holds the tensor, and warned rather than
+    raised because the wrong action on a four-node run is to take it down: a
+    LayerScale that is not 1.0 is still a better thing to push than the zero it
+    replaces.
+    """
+    try:
+        low, high = float(param.min()), float(param.max())
+    except Exception:  # noqa: BLE001 -- a check must not be the reason a sync dies
+        return
+    if low != 1.0 or high != 1.0:
+        logger.warning(
+            "nemotron: %s is not all ones (min %.6g, max %.6g). The loader synthesizes "
+            "ones for this tensor and the vision tower is frozen, so this means one of "
+            "those changed -- the engine will receive what is here.",
+            name, low, high,
+        )
+
+
 def _convert_vision(name: str, param: torch.Tensor):
     """Convert one Nemotron 3.5 Super VL vision-half parameter.
 
@@ -183,25 +211,35 @@ def _convert_vision(name: str, param: torch.Tensor):
     uses -- which is the point: those are the names SGLang already loads at
     startup, so a sync that reproduces them travels a path that is known to work.
 
-    Two parameters are deliberately NOT exported, and neither is an
-    approximation:
+    One parameter is deliberately NOT exported: `vision_model.summary_idxs`, a
+    config-derived buffer that the released index does not contain at all. The
+    loader synthesizes it from `vision_config.summary_idxs`; SGLang's RadioModel
+    registers it the same way, as a buffer, so there is no parameter to receive
+    it and `named_parameters()` never mentions it.
 
-    * `vision_model.summary_idxs` -- a config-derived buffer that the released
-      index does not contain at all. The loader synthesizes it from
-      `vision_config.summary_idxs`; SGLang's RadioModel registers it the same
-      way and has no parameter to receive it.
-    * `layer_scale[12].lambda1` -- also absent from the checkpoint. C-RADIO has
-      no LayerScale, `layerscale_value` is 1.0, and SGLang's radio.py has no
-      such parameter either (`grep layer_scale` finds nothing).
+    `layer_scale[12].lambda1` WAS in that list, and dropping it was the bug.
+    The reasoning was: the tensor is absent from the checkpoint, C-RADIO has no
+    LayerScale, `layerscale_value` is 1.0, and "SGLang's radio.py has no such
+    parameter either (`grep layer_scale` finds nothing)". The grep is right and
+    the conclusion was wrong -- SGLang calls them `ls1` and `ls2`
+    (`internvl.py:249-250`), they are real `nn.Parameter`s, and *nothing loading
+    them* is what makes them unrestorable rather than what makes them safe. With
+    the engine's memory released and re-acquired around every sync, a parameter
+    the sync does not write comes back **zero**, and a zero LayerScale turns
+    every ViT block into an identity: measured at
+    `|A| = 0.000000` against `|B| = 35.777088` (= sqrt(1280), i.e. exactly ones)
+    on all 32 blocks and all 8 ranks, with the tower's output then equal to its
+    patch embedding bit for bit. See
+    `Scripts-Slime/grpo_vlm_geo3k_nemotron3.5/docs/11_...block0_is_the_seam.md`.
 
-    Both would be a problem if training could move them. It cannot:
-    `slime_plugins/models/nemotron_35_super_vl.py:159` calls
-    `vision_model.requires_grad_(False)`, so the whole vision tower is frozen
-    and every tensor here is byte-identical to what the engine loaded at
-    startup. Exporting it at all is redundant rather than wrong -- kept because
-    a sync that silently omits half a model is exactly the failure this file's
-    docstring warns about, and because the freeze is a property of one plugin
-    line that could change.
+    So they are exported now, as `blocks.<i>.ls{1,2}` -- the names SGLang's
+    substring remap resolves to `model.encoder.layers.<i>.ls{1,2}`. The value is
+    1.0 by construction on this path: the loader synthesizes
+    `torch.full((hidden_size,), layerscale_value)` for them
+    (`hf_to_megatron/nemotron_h.py:275-280`), the tower is frozen
+    (`slime_plugins/models/nemotron_35_super_vl.py:265` calls
+    `requires_grad_(False)`), and `_assert_layer_scale_is_identity` below checks
+    it on the way out rather than trusting either of those to stay true.
     """
     if name == "vision_model.summary_idxs":
         return []
@@ -215,8 +253,10 @@ def _convert_vision(name: str, param: torch.Tensor):
     layer_idx, rest = layer_match.groups()
     hf_block = f"{_RADIO_PREFIX}.blocks.{layer_idx}"
 
-    if _VISION_LAYER_SCALE_RE.fullmatch(rest):
-        return []
+    layer_scale = _VISION_LAYER_SCALE_RE.fullmatch(rest)
+    if layer_scale:
+        _assert_layer_scale_is_identity(name, param)
+        return [(f"{hf_block}.ls{layer_scale.group(1)}", param)]
 
     qkv_match = _VISION_QKV_RE.fullmatch(rest)
     if qkv_match:

@@ -266,6 +266,83 @@ def test_synthesized_families_come_from_the_config():
     assert torch.all(scale == 1.0)
 
 
+def test_layer_scale_is_exported_under_sglangs_name():
+    """The 64 tensors whose omission made the engine's tower an identity.
+
+    `_convert_vision` used to return `[]` for `layer_scale{1,2}.lambda1` on the
+    grounds that nothing loads them. Nothing loading them is exactly why a sync
+    that skips them leaves zeros behind: the engine's memory is released and
+    re-acquired around the sync. Measured at |A| = 0 against |B| = sqrt(1280)
+    on all 32 blocks and 8 ranks before this was fixed.
+
+    The names have to be SGLang's, because that is who receives them:
+    `blocks.<i>.ls1` remaps to `model.encoder.layers.<i>.ls1`.
+    """
+    from slime.backends.megatron_utils.megatron_to_hf.nemotron_h import _convert_vision
+
+    ones = torch.ones(1280)
+    for index, suffix in ((1, "ls1"), (2, "ls2")):
+        out = _convert_vision(f"vision_model.encoder.layer.7.layer_scale{index}.lambda1", ones)
+        assert len(out) == 1, out
+        name, tensor = out[0]
+        assert name == f"{_RADIO_PREFIX}.blocks.7.{suffix}", name
+        assert tensor is ones
+
+
+def test_a_non_identity_layer_scale_is_reported_not_swallowed(caplog):
+    """Ones is the only value this path can produce; anything else is a signal.
+
+    The loader synthesizes `layerscale_value` and the tower is frozen, so a
+    tensor that is not all ones means one of those two stopped being true. It
+    is still exported -- whatever it holds beats the zero it replaces -- but it
+    does not pass in silence.
+    """
+    from slime.backends.megatron_utils.megatron_to_hf.nemotron_h import _convert_vision
+
+    with caplog.at_level("WARNING"):
+        out = _convert_vision(
+            "vision_model.encoder.layer.0.layer_scale1.lambda1", torch.full((1280,), 0.1)
+        )
+    assert len(out) == 1
+    assert "not all ones" in caplog.text
+
+
+def test_an_exported_layer_scale_is_preferred_over_the_synthesized_one():
+    """The round trip stays exact in the direction that was lossy once.
+
+    The released checkpoint has no LayerScale and the loader synthesizes ones.
+    A checkpoint written by this tree's exporter does have it, and reading the
+    file has to win -- otherwise a value that survived the export would be
+    silently replaced on the way back in.
+    """
+    class _Reader:
+        def __init__(self, tensors):
+            self.tensors = tensors
+
+        def __contains__(self, name):
+            return name in self.tensors
+
+        def get_tensor(self, name):
+            return self.tensors[name]
+
+    class _Config:
+        class vision_config:
+            hidden_size = 1280
+            layerscale_value = 1.0
+            summary_idxs = [0, 1]
+
+    exported = torch.full((1280,), 0.5)
+    reader = _Reader({f"{_RADIO_PREFIX}.blocks.3.ls2": exported})
+    got = _vision_hf_tensor("vision_model.encoder.layer.3.layer_scale2.lambda1", reader, _Config())
+    assert torch.equal(got, exported)
+
+    # ...and with nothing in the file, the synthesized ones still come back.
+    synthesized = _vision_hf_tensor(
+        "vision_model.encoder.layer.3.layer_scale2.lambda1", _Reader({}), _Config()
+    )
+    assert torch.all(synthesized == 1.0)
+
+
 def test_an_unknown_vision_name_raises_rather_than_guessing():
     class _Config:
         class vision_config:

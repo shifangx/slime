@@ -212,7 +212,10 @@ _VISION_LAYER_RE = re.compile(r"vision_model\.encoder\.layer\.(\d+)\.(.+)")
 # grouped-query asymmetry to respect.
 _VISION_QKV_RE = re.compile(r"attention\.attention\.(query|key|value)\.(weight|bias)")
 _VISION_QKV_CHUNK = {"query": 0, "key": 1, "value": 2}
-_VISION_LAYER_SCALE_RE = re.compile(r"layer_scale[12]\.lambda1")
+# The digit is captured because the exporter needs it: `layer_scale1` is the
+# attention residual's scale and `layer_scale2` the MLP's, and SGLang calls
+# them `ls1` / `ls2`.
+_VISION_LAYER_SCALE_RE = re.compile(r"layer_scale([12])\.lambda1")
 
 
 def _assert_no_tensor_parallel() -> None:
@@ -272,11 +275,21 @@ def _vision_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torch.T
     layer_idx, rest = layer_match.groups()
     hf_block = f"{_RADIO_PREFIX}.blocks.{layer_idx}"
 
-    if _VISION_LAYER_SCALE_RE.fullmatch(rest):
-        # Also absent from the checkpoint. C-RADIO has no LayerScale; the module
-        # is inherited and `layerscale_value` is 1.0, which makes it an identity
-        # op. Synthesizing ones is therefore exactly what `from_pretrained`
-        # leaves in place, not an approximation of it.
+    layer_scale = _VISION_LAYER_SCALE_RE.fullmatch(rest)
+    if layer_scale:
+        # Absent from the RELEASED checkpoint. C-RADIO has no LayerScale; the
+        # module is inherited and `layerscale_value` is 1.0, which makes it an
+        # identity op. Synthesizing ones is therefore exactly what
+        # `from_pretrained` leaves in place, not an approximation of it.
+        #
+        # A checkpoint written by this tree's exporter DOES carry it, under
+        # SGLang's spelling (`blocks.<i>.ls{1,2}`), because dropping it on
+        # export is what left the engine's copy zeroed after a sync. Prefer the
+        # file when it is there: synthesizing over a real value would make the
+        # round trip lossy in the one direction that was already lossy once.
+        exported = f"{hf_block}.ls{layer_scale.group(1)}"
+        if reader is not None and exported in reader:
+            return reader.get_tensor(exported)
         return torch.full((vision_config.hidden_size,), float(vision_config.layerscale_value))
 
     qkv_match = _VISION_QKV_RE.fullmatch(rest)
