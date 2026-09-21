@@ -57,9 +57,30 @@ MODEL_ARGS=(
    --moe-latent-size 1024                  # moe_latent_size
    --moe-ffn-hidden-size 2688              # moe_intermediate_size
    --moe-router-topk 22                    # num_experts_per_tok
-   --moe-router-score-function softmax
+   # DeepSeek-V3-style aux-loss-free routing, NOT softmax. Three independent
+   # witnesses agree on sigmoid, so this is the model's routing rather than the
+   # value that happens to silence the check:
+   #
+   #   * the checkpoint carries 41 gate.e_score_correction_bias tensors (40 MoE
+   #     layers + the MTP layer); that tensor only exists for aux-loss-free
+   #     routing;
+   #   * SGLang scores this architecture with scoring_func="sigmoid"
+   #     (sglang/srt/models/nemotron_h.py:213), alongside
+   #     routing_method_type=DeepSeekV3 and the same correction bias;
+   #   * MCore refuses the combination outright at transformer_config.py:2886 --
+   #       ValueError: Expert bias for aux-loss-free routing only supports
+   #                   'sigmoid' and 'sqrtsoftplus' score functions
+   #     which is exactly what killed job 19047346 on its first launch.
+   #
+   # norm_topk_prob: true needs no flag of its own -- MCore renormalises the
+   # top-k scores whenever topk > 1 (moe_utils.py:932), and topk is 22 here,
+   # which matches SGLang's renormalize=config.norm_topk_prob.
+   --moe-router-score-function sigmoid
    --moe-router-enable-expert-bias         # gate.e_score_correction_bias exists
    --moe-router-topk-scaling-factor 5.0    # routed_scaling_factor
+   # n_group and topk_group are both 1, so group-limited routing is a no-op.
+   # Leaving --moe-router-num-groups / --moe-router-group-topk unset is the
+   # equivalent configuration, not an omission.
    --moe-shared-expert-intermediate-size 5376   # moe_shared_expert_intermediate_size
    --moe-grouped-gemm
    --moe-token-dispatcher-type alltoall
