@@ -185,15 +185,52 @@ class NemotronHVLModel(MegatronModule):
         # pixel_values arrives as a list when the micro-batch holds images of
         # different resolutions, because this tower keeps them as pictures
         # rather than ragged-packed patches and they do not concatenate
-        # (backends/megatron_utils/data.py). The projector's own forward
-        # recurses on list/tuple and concatenates the per-image outputs, so the
-        # only thing to do here is cast each entry.
+        # (backends/megatron_utils/data.py).
+        #
+        # The list is iterated HERE rather than handed to the projector whole,
+        # and that is the whole point of this block. The reference projector
+        # does recurse on list/tuple, but it combines the per-image results with
+        #
+        #     torch.cat([self.forward(pv, vision_model) for pv in pixel_values], dim=0)
+        #
+        # (modeling_nemotron_h_omni.py:231) over tensors still shaped
+        # [n, tokens_i, hidden]. A cat on dim 0 requires every other dimension to
+        # agree, so that only works when every image in the list has the same
+        # resolution. This processor is aspect-ratio-preserving and
+        # variable-resolution (preprocessor_config.json: min_num_patches 1024,
+        # max_num_patches 13312), so tokens_i differs per image and the cat
+        # raises:
+        #
+        #   RuntimeError: Sizes of tensors must match except in dimension 0.
+        #                 Expected size 286 but got size 270 for tensor number 1
+        #
+        # -- jobs 19050220 (416 vs 384) and 19051011 (286 vs 270), both in
+        # train_one_step. The reference branch is fine for its own use, which is
+        # generate() on one image at a time.
+        #
+        # Flattening each image to [tokens_i, hidden] first makes the
+        # concatenation well defined for any mix of resolutions, and it is what
+        # sglang does for this same model on the same checkpoints
+        # (srt/models/nano_nemotron_vl.py:extract_feature_dynamic, which ends in
+        # `img_feats.view(-1, hidden)` per image and then one cat).
+        #
+        # For a list of equal-resolution images this is bit-identical to the old
+        # path -- cat-then-flatten and flatten-then-cat produce the same row
+        # order -- so it is a strict generalisation, not a behaviour change.
+        # Calling the projector per single tensor also keeps its own _project,
+        # and with it the vision_final_layernorm that only Super checkpoints
+        # carry.
         projector_dtype = next(self.vision_projector.parameters()).dtype
         if isinstance(pixel_values, (list, tuple)):
-            pixel_values = [image.to(dtype=projector_dtype) for image in pixel_values]
+            per_image = []
+            for image in pixel_values:
+                features = self.vision_projector(image.to(dtype=projector_dtype), self.vision_model)
+                per_image.append(features.reshape(-1, features.shape[-1]))
+            vision_output = torch.cat(per_image, dim=0)
         else:
-            pixel_values = pixel_values.to(dtype=projector_dtype)
-        vision_output = self.vision_projector(pixel_values, self.vision_model)
+            vision_output = self.vision_projector(
+                pixel_values.to(dtype=projector_dtype), self.vision_model
+            )
         vision_embeddings = vision_output.reshape(-1, vision_output.shape[-1]).to(
             device=embeddings.device, dtype=embeddings.dtype
         )
