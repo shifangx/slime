@@ -30,6 +30,13 @@ class SafetensorReader:
     def __contains__(self, name: str) -> bool:
         return name in self.weight_map
 
+    def get_slice(self, name: str):
+        """Read shape/dtype metadata without loading a full checkpoint tensor."""
+        filename = self.weight_map[name]
+        if filename not in self._files:
+            self._files[filename] = safe_open(self.path / filename, framework="pt", device="cpu")
+        return self._files[filename].get_slice(name)
+
     @functools.lru_cache(maxsize=1)  # noqa: B019 - cache belongs to this reader instance
     def get_tensor(self, name: str) -> torch.Tensor:
         try:
@@ -143,6 +150,22 @@ def _pad_vocab(args, name: str, tensor: torch.Tensor) -> torch.Tensor:
     return F.pad(tensor, (0, 0, 0, padded_size - tensor.shape[0]))
 
 
+def restore_fp32_router_buffers(model) -> int:
+    """Restore router FP32 buffers before direct HF copies, as in Shifang's loader.
+
+    Float16Module can downcast expert_bias, while copy_ bypasses the router's
+    load_state_dict hook. Widening after the copy cannot recover rounded values.
+    """
+    restored = 0
+    for chunk in model:
+        for module in chunk.modules():
+            guard = getattr(module, "_maintain_float32_expert_bias", None)
+            if callable(guard):
+                guard()
+                restored += 1
+    return restored
+
+
 def load_model_hf_weights(
     args,
     model,
@@ -152,6 +175,7 @@ def load_model_hf_weights(
 ) -> None:
     from slime.backends.megatron_utils.update_weight.common import named_params_and_buffers
 
+    restore_fp32_router_buffers(model)
     reader = SafetensorReader(path)
     with torch.no_grad():
         for name, parameter in named_params_and_buffers(args, model):

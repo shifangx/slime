@@ -11,6 +11,74 @@ from slime.utils.types import RolloutBatch
 from .cp_utils import slice_with_cp
 
 
+def _concat_multimodal_field(left, right):
+    """Join one processor output field across the samples of a micro-batch.
+
+    `torch.cat` alone covers the fixed-resolution processors -- Qwen3.5-VL's
+    `pixel_values` is one tensor per sample and they stack on dim 0. It does not
+    cover the dynamic-resolution ones: Nemotron 3.5 Super VL's image processor
+    resizes each image to its own aspect-preserving patch grid and returns
+    `pixel_values` as a *list* of `(3, H, W)` tensors whenever those shapes
+    differ, plus `num_patches` / `num_tokens` as plain Python lists. Those are
+    not a defect to normalize away -- the model's own vision projector takes the
+    list form and iterates it -- so the micro-batch join has to be per-type.
+
+    Sequences concatenate, tensors `cat` on dim 0, and anything else is an
+    unhandled processor output rather than something to guess at.
+
+    TWO TENSORS ARE NOT ENOUGH TO JUSTIFY A `cat`
+    ---------------------------------------------
+    The processor stacks per *sample*, so it returns a tensor whenever the
+    images within one sample share a size -- and says nothing about the next
+    sample. Two samples that are each internally uniform but differ from each
+    other both arrive as tensors with incompatible trailing shapes, and
+    `torch.cat` on dim 0 raises:
+
+        RuntimeError: Sizes of tensors must match except in dimension 0.
+        Expected size 480 but got size 384 for tensor number 1 in the list.
+
+    That is job 18824653, which got through the weight sync and its first
+    rollout and then died on the first micro-batch of `actor_train`. The two
+    mixed branches below already resolve exactly this collision by degrading to
+    the list form; this branch was the one case that assumed the shapes agreed.
+    """
+    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+        # Only dim 0 is the join axis, so everything after it has to match for a
+        # `cat` to mean what it says. When it does not, fall back to the list
+        # form -- `project_images` iterates it and projects each image on its
+        # own, which is the whole reason that branch exists.
+        if left.shape[1:] == right.shape[1:]:
+            return torch.cat([left, right], dim=0)
+        # Unbinding dim 0 is the inverse of the stack the processor made, so it
+        # is only right if dim 0 really is the image axis on both sides. Equal
+        # rank is what says so; unequal rank would mean one of them is a bare
+        # `(3, H, W)` single image, and `list()` on that yields `H` tensors of
+        # shape `(W,)` -- garbage the projector would accept without complaint.
+        # Nothing observed produces that, so it is an error rather than a case
+        # to guess at.
+        if left.dim() != right.dim():
+            raise ValueError(
+                f"cannot join multimodal tensors of shapes {tuple(left.shape)} and "
+                f"{tuple(right.shape)} across a micro-batch: the trailing shapes differ, so "
+                "this has to degrade to the per-image list form, but the ranks differ too, so "
+                "which axis is the image axis is ambiguous."
+            )
+        return list(left) + list(right)
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return list(left) + list(right)
+    # One of each: a processor that stacked for one sample and could not for the
+    # next, which is exactly what happens when sample A has two same-sized
+    # images and sample B has two different-sized ones.
+    if isinstance(left, torch.Tensor) and isinstance(right, (list, tuple)):
+        return list(left) + list(right)
+    if isinstance(left, (list, tuple)) and isinstance(right, torch.Tensor):
+        return list(left) + list(right)
+    raise TypeError(
+        f"cannot join multimodal fields of types {type(left).__name__} and {type(right).__name__} "
+        "across a micro-batch"
+    )
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -143,7 +211,7 @@ def get_batch(
                     if key not in multimodal_data:
                         multimodal_data[key] = mm_tensor
                     else:
-                        multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)
+                        multimodal_data[key] = _concat_multimodal_field(multimodal_data[key], mm_tensor)
         batch["multimodal_train_inputs"] = multimodal_data
 
     return batch

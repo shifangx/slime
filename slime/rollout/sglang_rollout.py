@@ -25,6 +25,7 @@ from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
     build_processor_kwargs,
     encode_image_for_rollout_engine,
+    is_nemotron_processor,
     load_processor,
     load_tokenizer,
 )
@@ -47,8 +48,14 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     )
 
     if processor and has_multimodal_inputs and not reuse_existing_input_ids:
-        processor_output = processor(text=sample.prompt, **build_processor_kwargs(raw_multimodal_inputs))
+        if is_nemotron_processor(processor):
+            processor_output = processor(
+                text=sample.prompt, images=raw_multimodal_inputs.get("images"), return_tensors="pt"
+            )
+        else:
+            processor_output = processor(text=sample.prompt, **build_processor_kwargs(raw_multimodal_inputs))
         prompt_ids = processor_output["input_ids"][0]
+        prompt_ids = [int(token) for token in prompt_ids]
         if sample.multimodal_train_inputs is None:
             sample.multimodal_train_inputs = {
                 k: v for k, v in processor_output.items() if k not in _PROCESSOR_PROMPT_KEYS
@@ -179,6 +186,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+    if is_nemotron_processor(state.processor):
+        payload["return_prompt_token_ids"] = True
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -204,6 +213,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
         output = await post(url, payload, headers=headers)
         span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
+
+    if is_nemotron_processor(state.processor):
+        if output.get("prompt_token_ids") != prompt_ids or output["meta_info"]["prompt_tokens"] != len(prompt_ids):
+            raise ValueError("Nemotron training and rollout processed different prompt tokens; check the HF processor")
 
     if "output_token_logprobs" in output["meta_info"]:
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]

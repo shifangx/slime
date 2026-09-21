@@ -129,6 +129,9 @@ class UpdateWeightFromDistributed:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
+            if "nemotron" in self.model_name.lower():
+                # Projector updates also invalidate cached vision features.
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
@@ -160,7 +163,7 @@ class UpdateWeightFromDistributed:
         for name, param in named_params_and_buffers(self.args, self.model):
             if ".experts." in name:
                 continue
-            param = all_gather_param(name, param)
+            param = all_gather_param(self.args, name, param)
             if not self._is_pp_src_rank:
                 continue
             hf_chunk = convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
@@ -183,7 +186,7 @@ class UpdateWeightFromDistributed:
         buffer_size = 0
         batch: list[tuple[str, torch.Tensor]] = []
         for name, param in params:
-            param = all_gather_param(name, param)
+            param = all_gather_param(self.args, name, param)
             param_size = param.numel() * param.element_size()
             if (
                 buffer_size + param_size

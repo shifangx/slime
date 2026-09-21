@@ -94,6 +94,18 @@ def load_processor(name_or_path: str, **kwargs):
         # Fallback: try to construct a GLM-4.6V / GLM-4.5V processor manually.
         proc = _try_load_glm4v_processor(name_or_path, **kwargs)
 
+    if proc is not None:
+        from transformers import PretrainedConfig
+
+        try:
+            config, _ = PretrainedConfig.get_config_dict(name_or_path, **kwargs)
+        except (OSError, ValueError):
+            config = {}
+        proc._slime_model_type = (
+            "nemotron_h_omni"
+            if "NemotronH_Omni_Reasoning_V3" in (config.get("architectures") or [])
+            else config.get("model_type")
+        )
     return proc
 
 
@@ -130,12 +142,23 @@ def _extract_images_from_messages(messages):
     return images
 
 
+def is_nemotron_processor(processor) -> bool:
+    # Nano and Super remote processors can share a class name; use the config.
+    return getattr(processor, "_slime_model_type", None) == "nemotron_h_omni"
+
+
 def process_vision_info(prompt, processor):
     """Extract PIL images (and videos) from the message list for training.
 
     Tries qwen_vl_utils first (Qwen VL family), falls back to generic
     extraction for other models (e.g. GLM-4.6V).
     """
+    if is_nemotron_processor(processor):
+        # Qwen's helper resizes images even for non-Qwen processors. Leave the
+        # geometry to Nemotron's own processor on both the trainer and server.
+        images = [image.convert("RGB") for image in _extract_images_from_messages(prompt)]
+        return {"images": images or None, "videos": None}
+
     try:
         from qwen_vl_utils import process_vision_info as qwen_process_vision_info
 
