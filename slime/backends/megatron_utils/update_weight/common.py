@@ -11,11 +11,71 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 from slime.utils.types import ParamInfo
 
 
-def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
+def has_gated_linear_unit(args: Namespace) -> bool:
+    """
+    Whether ``linear_fc1`` holds the fused gate+up tensor.
+
+    There is no ``--gated-linear-unit`` flag: megatron derives
+    ``config.gated_linear_unit`` in ``training/argument_utils.py`` from the
+    activation, and only ``--swiglu`` and ``--quick-geglu`` set it. Models such
+    as nemotron_h (``--squared-relu``) are ungated, and their ``linear_fc1`` is
+    ``up_proj`` alone -- half the width, and no gate half to de-interleave.
+    """
+    return bool(
+        getattr(args, "gated_linear_unit", False)
+        or getattr(args, "swiglu", False)
+        or getattr(args, "quick_geglu", False)
+    )
+
+
+def merge_tp_partitions(
+    args: Namespace,
+    name: str,
+    param_partitions: list[torch.Tensor],
+    partition_dim: int,
+    partition_sizes: list[int] | None = None,
+) -> torch.Tensor:
+    """
+    Concatenate per-TP-rank partitions back into the full tensor.
+
+    Plain column/row parallelism is a contiguous concat along ``partition_dim``.
+    Two layouts are not:
+
+    * **fused gate+up ``linear_fc1``** -- each rank holds ``[gate_r, up_r]`` and
+      the full tensor is ``[gate_0..gate_n, up_0..up_n]``. Only when the model is
+      gated at all; see ``has_gated_linear_unit``.
+    * **block-interleaved TP** (``partition_sizes``, set by megatron on Mamba
+      ``in_proj`` / ``conv1d`` and the GDN mixers) -- each rank holds one slice of
+      *every* component, e.g. ``[z_r, x_r, B_r, C_r, dt_r]``, and the full tensor
+      groups the components, ``[z, x, B, C, dt]``. A contiguous concat would give
+      rank 0's ``z`` followed by rank 0's ``x`` and silently produce garbage.
+
+    Both are the same operation over different block sizes.
+    """
+    if has_gated_linear_unit(args) and ("linear_fc1.weight" in name or "linear_fc1.bias" in name):
+        assert partition_sizes is None, f"{name}: gate+up fusion and partition_sizes are mutually exclusive"
+        half = param_partitions[0].size(partition_dim) // 2
+        partition_sizes = [half, half]
+    # this is bug in megatron's grouped moe.
+    if "linear_fc2.weight" in name:
+        if partition_dim == 0:
+            partition_dim = 1
+
+    # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
+    if not partition_sizes:
+        return torch.cat(param_partitions, dim=partition_dim)
+
+    blocks = [p.split(partition_sizes, dim=partition_dim) for p in param_partitions]
+    return torch.cat(
+        [rank_blocks[i] for i in range(len(partition_sizes)) for rank_blocks in blocks], dim=partition_dim
+    )
+
+
+def all_gather_param(args: Namespace, name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """
     All-gather TP-sharded param to full tensor. expert_bias→param,
     non-TP/duplicated/TP-size-1→param.data.
-    Uses expert-TP for ".experts.", else regular-TP. linear_fc1 rechunked (GLU), linear_fc2 dim fix.
+    Uses expert-TP for ".experts.", else regular-TP. Reassembly by merge_tp_partitions.
     """
     if "expert_bias" in name:
         return param
@@ -39,31 +99,23 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
 
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
-    partition_dim = param.partition_dim
     assert param.partition_stride == 1 or (
         param.partition_stride == 2 and "linear_fc1" in name
     ), "partition_stride != 1 is not supported"
-    # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-    # TODO: check only GLU is used.
-    if "linear_fc1.weight" in name or "linear_fc1.bias" in name:
-        param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
-        param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
-    # this is bug in megatron's grouped moe.
-    if "linear_fc2.weight" in name:
-        if partition_dim == 0:
-            partition_dim = 1
-    param = torch.cat(param_partitions, dim=partition_dim)
-    return param
+    return merge_tp_partitions(
+        args, name, param_partitions, param.partition_dim, getattr(param, "partition_sizes", None)
+    )
 
 
 def all_gather_params_async(
+    args: Namespace,
     param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
 ) -> list[torch.Tensor]:
     """
     Parallel TP all-gather for multiple params. Loop 1: for each TP param, allocate buffers +
     dist.all_gather(async_op=True) on expert-TP/regular-TP group
     (skip expert_bias/non-TP/duplicated/TP-size-1).
-    Loop 2: wait all NCCL handles (enables overlap). Loop 3: concat partitions + apply GLU rechunk/MoE dim fix.
+    Loop 2: wait all NCCL handles (enables overlap). Loop 3: reassemble via merge_tp_partitions.
     """
     # Phase 1: Start all async all_gather operations
     gather_tasks = []
@@ -110,16 +162,9 @@ def all_gather_params_async(
         else:
             # Process the gathered partitions (same logic as original all_gather_param)
             assert partition_dim is not None, "partition_stride != 1 is not supported"
-            # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-            # TODO: check only GLU is used.
-            if "linear_fc1.weight" in info.name or "linear_fc1.bias" in info.name:
-                param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
-                param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
-            # this is bug in megatron's grouped moe.
-            if "linear_fc2.weight" in info.name:
-                if partition_dim == 0:
-                    partition_dim = 1
-            param = torch.cat(param_partitions, dim=partition_dim)
+            param = merge_tp_partitions(
+                args, info.name, param_partitions, partition_dim, info.attrs.get("partition_sizes")
+            )
 
         gathered_params.append(param)
 

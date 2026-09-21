@@ -4,6 +4,7 @@ from .glm4moe import convert_glm4moe_to_hf
 from .llama import convert_llama_to_hf
 from .mimo import convert_mimo_to_hf
 from .minimax_m2 import convert_minimax_m2_to_hf
+from .nemotron_h import convert_nemotron_h_to_hf, pending_vision_qkv
 from .processors import quantize_params, remove_padding
 from .qwen2 import convert_qwen2_to_hf
 from .qwen3_5 import convert_qwen3_5_to_hf
@@ -26,6 +27,13 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None, trans
     return quantize_params(args, name, converted_named_tensors, quantization_config, transform_ue8m0)
 
 
+def assert_conversion_buffers_drained(context: str = "end of weight sync") -> None:
+    """Refuse a partial vision update when not all Q/K/V parameters arrived."""
+    pending = pending_vision_qkv()
+    if pending:
+        raise ValueError(f"Incomplete Nemotron vision QKV conversion at {context}: {pending}")
+
+
 # TODO optimize
 _cached_tensors = {}
 
@@ -35,6 +43,8 @@ def _convert_to_hf_core(args, model_name, name, param):
     model_name = model_name.lower().replace("_", "").replace("-", "")
     if "minimaxm2" in model_name:
         converted_named_tensors = convert_minimax_m2_to_hf(args, name, param)
+    elif "nemotronh" in model_name:
+        converted_named_tensors = convert_nemotron_h_to_hf(args, name, param, model_name)
     elif any(family in model_name for family in ("glm4moelite", "deepseekv3", "deepseekv32", "glmmoedsa", "kimi")):
         converted_named_tensors = convert_deepseekv3_to_hf(args, name, param)
     elif "glm4moe" in model_name:

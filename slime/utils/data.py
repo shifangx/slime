@@ -111,11 +111,17 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
                 if len(input_ids) <= max_length:
                     kept.append((position, sample))
         if multimodal:
-            from slime.utils.processing_utils import process_vision_info
+            from slime.utils.processing_utils import is_nemotron_processor, process_vision_info
 
             for position, sample in multimodal:
-                multimodal_inputs = process_vision_info(sample.prompt, processor)
-                processor_output = processor(text=sample.prompt, **multimodal_inputs)
+                if is_nemotron_processor(processor):
+                    # Dataset extracted the images before rendering this prompt.
+                    processor_output = processor(
+                        text=sample.prompt, images=sample.multimodal_inputs["images"], return_tensors="pt"
+                    )
+                else:
+                    multimodal_inputs = process_vision_info(sample.prompt, processor)
+                    processor_output = processor(text=sample.prompt, **multimodal_inputs)
                 input_ids = processor_output["input_ids"][0]
                 if len(input_ids) <= max_length:
                     kept.append((position, sample))
@@ -246,7 +252,10 @@ class Dataset:
                 metadata["tools"] = tools
 
             if apply_chat_template:
-                output_prompt = tokenizer.apply_chat_template(
+                from slime.utils.processing_utils import is_nemotron_processor
+
+                template_owner = processor if is_nemotron_processor(processor) else tokenizer
+                output_prompt = template_owner.apply_chat_template(
                     prompt,
                     tools=tools,
                     tokenize=False,

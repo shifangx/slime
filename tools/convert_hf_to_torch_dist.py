@@ -1,9 +1,12 @@
+import argparse
 import gc
 import os
+import pickle
 import shutil
 
 import torch
 import torch.distributed as dist
+from megatron.core.dist_checkpointing import load_common_state_dict
 from megatron.core.enums import ModelType
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_tracker_filename, save_checkpoint
@@ -28,6 +31,11 @@ def add_convertion_args(parser):
         help="Path to a custom model provider function.",
     )
     parser.add_argument("--allgather-cp", action="store_true", default=False)
+    parser.add_argument(
+        "--no-auto-pipeline",
+        action="store_true",
+        help="Keep the requested pipeline size, e.g. TP1/EP8/PP1 for Nemotron VL import.",
+    )
     try:
         parser.add_argument("--padded-vocab-size", type=int, default=None)
     except Exception:
@@ -53,7 +61,7 @@ def get_args():
     def ceildiv(a, b):
         return -(a // -b)
 
-    if args.pipeline_model_parallel_size == 1 and world_size > 1:
+    if args.pipeline_model_parallel_size == 1 and world_size > 1 and not args.no_auto_pipeline:
         pp_size = world_size
         while True:
             args.pipeline_model_parallel_size = pp_size
@@ -76,6 +84,67 @@ def get_args():
 
     validate_args(args)
     return args
+
+
+def save_common_state(args, checkpoint_dir):
+    """Write `common.pt` next to the shards.
+
+    megatron's `torch_dist` save does not produce one -- no checkpoint in this
+    tree has it, converted or trained, only `.metadata` / `metadata.json` /
+    `__N_M.distcp` -- but slime's own `tools/convert_torch_dist_to_hf.py` opens
+    `<iteration>/common.pt` and reads `["args"]` from it unconditionally. So
+    without this file the exporter cannot read the checkpoint the importer just
+    wrote, which is how a 227 GB artifact ends up being unreadable by the tool
+    written to consume it.
+
+    What the readers actually want out of it is small -- `num_layers`,
+    `num_experts`, `vocab_size`, `hidden_size`, `kv_channels`,
+    `num_attention_heads`, `num_query_groups`, `q_lora_rank` -- but the whole
+    namespace is stored, because the next consumer will want a different field
+    and guessing which is how this file came to be missing in the first place.
+
+    Attributes that do not pickle are dropped and named rather than failing the
+    job: the checkpoint is already on disk by the time this runs, and an hour of
+    conversion should not be lost to one un-serializable flag.
+
+    The file is a *merge* onto what `save_checkpoint` already put in the
+    checkpoint's embedded `common_state`, not a replacement for it. mcore's
+    `load_common_state_dict` short-circuits to `common.pt` whenever that file
+    exists (`dist_checkpointing/serialization.py`, `_legacy_common_state_exists`),
+    so a bare `{"args": ...}` here silently hides every other field the trainer
+    saved -- notably `checkpoint_version`, without which `check_checkpoint_args`
+    takes its pre-3.0 branch and dies looking up the long-removed
+    `model_parallel_size`.
+    """
+    keep, dropped = {}, []
+    for key, value in vars(args).items():
+        try:
+            pickle.dumps(value)
+        except Exception:  # noqa: BLE001 -- the reason does not change what we do
+            dropped.append(key)
+        else:
+            keep[key] = value
+
+    # Read before writing: once common.pt is on disk it shadows the embedded copy.
+    try:
+        common = load_common_state_dict(checkpoint_dir)
+    except Exception as e:  # noqa: BLE001 -- any failure here means "nothing to merge"
+        print(f"could not read embedded common state ({e}); writing args only")
+        common = {}
+    if not isinstance(common, dict):
+        print(f"unexpected embedded common state of type {type(common)!r}; writing args only")
+        common = {}
+
+    common["args"] = argparse.Namespace(**keep)
+    # save_checkpoint stamps this, but a checkpoint written by an older mcore may not.
+    common.setdefault("checkpoint_version", 3.0)
+
+    path = os.path.join(checkpoint_dir, "common.pt")
+    torch.save(common, path)
+    print(
+        f"wrote {path} with keys {sorted(common)}"
+        + (f" (dropped {len(dropped)} unpicklable args: {sorted(dropped)})" if dropped else "")
+    )
 
 
 def main():
@@ -138,6 +207,7 @@ def main():
         source_dir = get_checkpoint_name(args.save, 1, False, return_base_dir=True)
         target_dir = get_checkpoint_name(args.save, -1, True, return_base_dir=True)
         shutil.move(source_dir, target_dir)
+        save_common_state(args, target_dir)
     dist.barrier()
     dist.destroy_process_group()
 

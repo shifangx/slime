@@ -218,7 +218,10 @@ class SGLangEngine(RayActor):
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
             raise
-        return response.json()
+        result = response.json()
+        if isinstance(result, dict) and result.get("success") is False:
+            raise RuntimeError(f"SGLang {endpoint} failed: {result.get('message', result)}")
+        return result
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
