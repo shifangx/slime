@@ -173,8 +173,12 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
         if rest == "mixer.in_proj.weight":
             components = _split_in_proj(reader.get_tensor(f"{hf}.mixer.in_proj.weight"), hf_config)
             return _interleave_tp(components, tp)
-        if rest in {"mixer.conv1d.weight", "mixer.conv1d.bias"}:
-            suffix = rest.removeprefix("mixer.conv1d.")
+        # MCore registers these as FLAT parameters -- conv1d_weight, not a
+        # conv1d submodule with a .weight (ssm/mamba_mixer.py:329,338) -- while
+        # HF has a real nn.Conv1d. Same shapes either way, [conv_dim, 1, d_conv]
+        # and [conv_dim]; only the name differs. Job 19048940 died here.
+        if rest in {"mixer.conv1d_weight", "mixer.conv1d_bias"}:
+            suffix = "weight" if rest.endswith("_weight") else "bias"
             tensor = reader.get_tensor(f"{hf}.mixer.conv1d.{suffix}")
             return _interleave_tp(_split_conv1d(tensor, hf_config), tp)
         # A_log, D and dt_bias are one value per Mamba head, so a plain chunk

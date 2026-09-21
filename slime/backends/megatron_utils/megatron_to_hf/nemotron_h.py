@@ -124,8 +124,10 @@ def convert_nemotron_h_to_hf(args, name, param):
         if rest == "mixer.in_proj.weight":
             flat = _deinterleave_tp(param, [d_inner, d_inner, groups_state, groups_state, nheads], tp)
             return [(f"{hf}.mixer.in_proj.weight", flat)]
-        if rest in {"mixer.conv1d.weight", "mixer.conv1d.bias"}:
-            suffix = rest.removeprefix("mixer.conv1d.")
+        # Flat on the MCore side (conv1d_weight), a real nn.Conv1d on the HF
+        # side (conv1d.weight). Shapes match; only the name differs.
+        if rest in {"mixer.conv1d_weight", "mixer.conv1d_bias"}:
+            suffix = "weight" if rest.endswith("_weight") else "bias"
             flat = _deinterleave_tp(param, [d_inner, groups_state, groups_state], tp)
             return [(f"{hf}.mixer.conv1d.{suffix}", flat)]
         if rest in {"mixer.A_log", "mixer.D", "mixer.dt_bias", "mixer.norm.weight", "mixer.out_proj.weight"}:
