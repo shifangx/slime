@@ -128,6 +128,23 @@ class NemotronHVLModel(MegatronModule):
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
             rotary_base=args.rotary_base,
+            # The embedding must NOT shard the sequence itself. It does by
+            # default under --sequence-parallel (LanguageModelEmbedding:143-145),
+            # and _inject_vision_embeddings() builds its <image> mask from the
+            # full packed sequence -- so with TP2 the mask is twice the length of
+            # what it indexes:
+            #
+            #   IndexError: The shape of the mask [2304] at index 0 does not
+            #               match the shape of the indexed tensor [1152, 4096]
+            #
+            # (job 19051632). Vision injection has to happen on the whole
+            # sequence, so the scatter is deferred to the end of that method.
+            # HybridModel re-scatters for a standalone LM forward
+            # (hybrid_model.py:501), but only on the branch that builds
+            # decoder_input from the embedding; this wrapper passes its own, so
+            # that branch is skipped and the sequence is scattered exactly once.
+            # ../qwen3_5_vl.py passes this flag for the same reason.
+            scatter_embedding_sequence_parallel=False,
             vp_stage=vp_stage,
         )
 
