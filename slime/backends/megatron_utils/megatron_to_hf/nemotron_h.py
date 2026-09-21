@@ -1,0 +1,172 @@
+"""Megatron -> HuggingFace name mapping for NVIDIA Nemotron-H (`nemotron_h`).
+
+The inverse of hf_to_megatron/nemotron_h.py, used by the RL weight sync: GRPO
+pushes Megatron's parameters into the colocated SGLang engine on every rollout,
+and SGLang wants them under the checkpoint's own names.
+
+Two asymmetries with the loading direction are worth stating, because they are
+where this file can be wrong in a way that does not raise:
+
+  * Tensors arrive TP-gathered, and the gather is a plain concat of per-rank
+    shards along partition_dim (update_weight/common.py:41-55). For the Mamba
+    in_proj and conv1d that means the incoming layout is the *interleaved* one
+    hf_to_megatron builds -- [z_0, x_0, B_0, C_0, dt_0, z_1, ...] -- and it has
+    to be flattened back to the checkpoint's [z | x | B | C | dt] before
+    SGLang sees it. _deinterleave_tp is exactly the inverse of
+    hf_to_megatron/nemotron_h.py::_interleave_tp, and like it, it is the
+    identity at TP1.
+
+  * One HF tensor is produced by three different Megatron names, because MCore
+    folds the pre-mixer norm into whichever linear comes first. Emitting it
+    from all three is correct -- they hold the same values -- but it does mean
+    the same HF key is written more than once per sync.
+"""
+
+from __future__ import annotations
+
+import re
+
+import torch
+
+
+def _tp_size(args) -> int:
+    return max(1, int(getattr(args, "tensor_model_parallel_size", 1) or 1))
+
+
+def _mamba_dims(args) -> tuple[int, int, int]:
+    """(d_inner, groups_state, nheads) -- component sizes inside in_proj."""
+    nheads = args.mamba_num_heads
+    d_inner = nheads * args.mamba_head_dim
+    groups_state = args.mamba_num_groups * args.mamba_state_dim
+    return d_inner, groups_state, nheads
+
+
+def _deinterleave_tp(tensor: torch.Tensor, sizes: list[int], tp_size: int) -> torch.Tensor:
+    """Undo the per-rank interleaving, returning components concatenated whole.
+
+    ``sizes`` are the FULL (all-rank) sizes of each component, in order.
+    """
+    if tp_size == 1:
+        return tensor.contiguous()
+
+    total = sum(sizes)
+    if tensor.shape[0] != total:
+        raise ValueError(f"expected {total} rows to de-interleave, got {tensor.shape[0]}")
+
+    local_sizes = []
+    for size in sizes:
+        if size % tp_size != 0:
+            raise ValueError(f"component of size {size} does not divide across TP{tp_size}")
+        local_sizes.append(size // tp_size)
+
+    per_rank = sum(local_sizes)
+    parts: list[list[torch.Tensor]] = [[] for _ in sizes]
+    for rank in range(tp_size):
+        offset = rank * per_rank
+        for index, local in enumerate(local_sizes):
+            parts[index].append(tensor[offset : offset + local])
+            offset += local
+    return torch.cat([torch.cat(blocks, dim=0) for blocks in parts], dim=0).contiguous()
+
+
+def _split_qkv(param: torch.Tensor, args) -> list[tuple[str, torch.Tensor]]:
+    """linear_qkv is grouped per KV head; the checkpoint wants q/k/v apart."""
+    num_groups = args.num_query_groups
+    head_dim = args.kv_channels
+    queries_per_group = args.num_attention_heads // num_groups
+
+    trailing = param.shape[1:]
+    grouped = param.reshape(num_groups, (queries_per_group + 2) * head_dim, *trailing)
+    q = grouped[:, : queries_per_group * head_dim].reshape(-1, *trailing)
+    k = grouped[:, queries_per_group * head_dim : (queries_per_group + 1) * head_dim].reshape(-1, *trailing)
+    v = grouped[:, (queries_per_group + 1) * head_dim :].reshape(-1, *trailing)
+    return [q.contiguous(), k.contiguous(), v.contiguous()]
+
+
+def convert_nemotron_h_to_hf(args, name, param):
+    """Convert one Nemotron-H Megatron parameter to its HuggingFace form."""
+
+    while name.startswith("module."):
+        name = name.removeprefix("module.")
+    name = name.removeprefix("language_model.")
+
+    direct = {
+        "embedding.word_embeddings.weight": "backbone.embeddings.weight",
+        "decoder.final_norm.weight": "backbone.norm_f.weight",
+        "decoder.final_layernorm.weight": "backbone.norm_f.weight",
+        "output_layer.weight": "lm_head.weight",
+    }
+    if name in direct:
+        return [(direct[name], param)]
+
+    layer_match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
+    if not layer_match:
+        raise ValueError(f"Unsupported Nemotron-H Megatron parameter {name!r}")
+    layer_idx, rest = layer_match.groups()
+    layer_idx = int(layer_idx)
+
+    pattern = args.hybrid_override_pattern.split("/")[0]
+    symbol = pattern[layer_idx]
+    hf = f"backbone.layers.{layer_idx}"
+
+    # The pre-mixer norm, whichever linear MCore folded it into.
+    if rest in {
+        "mixer.in_proj.layer_norm_weight",
+        "self_attention.linear_qkv.layer_norm_weight",
+        "pre_mlp_layernorm.weight",
+        "input_layernorm.weight",
+    }:
+        return [(f"{hf}.norm.weight", param)]
+
+    if symbol == "M":
+        tp = _tp_size(args)
+        d_inner, groups_state, nheads = _mamba_dims(args)
+        if rest == "mixer.in_proj.weight":
+            flat = _deinterleave_tp(param, [d_inner, d_inner, groups_state, groups_state, nheads], tp)
+            return [(f"{hf}.mixer.in_proj.weight", flat)]
+        if rest in {"mixer.conv1d.weight", "mixer.conv1d.bias"}:
+            suffix = rest.removeprefix("mixer.conv1d.")
+            flat = _deinterleave_tp(param, [d_inner, groups_state, groups_state], tp)
+            return [(f"{hf}.mixer.conv1d.{suffix}", flat)]
+        if rest in {"mixer.A_log", "mixer.D", "mixer.dt_bias", "mixer.norm.weight", "mixer.out_proj.weight"}:
+            return [(f"{hf}.{rest}", param)]
+        raise ValueError(f"Unsupported Nemotron-H Mamba parameter {name!r}")
+
+    if symbol == "*":
+        if rest == "self_attention.linear_qkv.weight":
+            q, k, v = _split_qkv(param, args)
+            return [
+                (f"{hf}.mixer.q_proj.weight", q),
+                (f"{hf}.mixer.k_proj.weight", k),
+                (f"{hf}.mixer.v_proj.weight", v),
+            ]
+        if rest == "self_attention.linear_proj.weight":
+            return [(f"{hf}.mixer.o_proj.weight", param)]
+        raise ValueError(f"Unsupported Nemotron-H attention parameter {name!r}")
+
+    if symbol == "E":
+        if rest == "mlp.router.weight":
+            return [(f"{hf}.mixer.gate.weight", param)]
+        if rest == "mlp.router.expert_bias":
+            return [(f"{hf}.mixer.gate.e_score_correction_bias", param)]
+        if rest in {"mlp.fc1_latent_proj.weight", "mlp.fc2_latent_proj.weight"}:
+            return [(f"{hf}.mixer.{rest.removeprefix('mlp.')}", param)]
+
+        # Non-gated experts: linear_fc1 is up_proj alone, not cat(gate, up).
+        expert_match = re.fullmatch(r"mlp\.experts\.linear_fc([12])(?:\.weight)?(\d+)?", rest)
+        if expert_match:
+            projection, expert_idx = expert_match.groups()
+            hf_proj = "up_proj" if projection == "1" else "down_proj"
+            if expert_idx is None:
+                raise ValueError(f"{name!r} addresses the whole expert stack; expected a per-expert weight")
+            return [(f"{hf}.mixer.experts.{int(expert_idx)}.{hf_proj}.weight", param)]
+
+        shared = {
+            "mlp.shared_experts.linear_fc1.weight": "up_proj",
+            "mlp.shared_experts.linear_fc2.weight": "down_proj",
+        }
+        if rest in shared:
+            return [(f"{hf}.mixer.shared_experts.{shared[rest]}.weight", param)]
+        raise ValueError(f"Unsupported Nemotron-H MoE parameter {name!r}")
+
+    raise ValueError(f"Layer {layer_idx} has unknown hybrid symbol {symbol!r} for parameter {name!r}")
