@@ -7,7 +7,7 @@ prefix the omni checkpoint puts in front of it and the handful of vision keys:
     Megatron parameter                         HF checkpoint key
     ---------------------------------------    -------------------------------
     language_model.<anything>                  language_model.<nemotron_h name>
-    vision_model.<anything>                    vision_model.<same>
+    vision_model.<anything>                    see _VISION_RENAMES
     vision_projector.mlp1.norm.weight          mlp1.0.weight
     vision_projector.mlp1.linear1.weight       mlp1.1.weight
     vision_projector.mlp1.linear2.weight       mlp1.3.weight
@@ -18,6 +18,20 @@ conversion mapping, registered by ``register_nemotron_h_omni_conversion_mapping`
 in its ``modeling_nemotron_h_omni.py``. The projector is built from that same
 remote code (see ``slime_plugins/models/nemotron_h_vl.py``), so its parameter
 names are the reference's and the mapping has to be too.
+
+The same is true, and less obviously so, of the vision tower: it is
+``modeling_radio.RadioModel``, whose module tree is *not* the one the released
+weights use. The checkpoint is timm-style C-RADIO --
+``radio_model.model.blocks.{N}.attn.qkv`` with a fused qkv -- and
+``RadioModel.__init__`` calls ``register_radio_conversion_mapping()`` to rewrite
+it on load. Treating the vision half as a pass-through is what killed job
+19049784 on the first tensor it reached:
+
+    KeyError: HuggingFace checkpoint does not contain
+              'vision_model.embeddings.position_embedding'
+
+_VISION_RENAMES below is that registered mapping, inverted. Nothing here is
+guessed; see modeling_radio.py:43-75 for the forward form of every line.
 
 The vision tower and projector are replicated across TP ranks rather than
 sharded, so their tensors pass through whole.
@@ -42,6 +56,82 @@ _MLP1_RENAMES = {
 }
 
 _BLOCK_TYPE_SYMBOLS = {"mamba": "M", "moe": "E", "attention": "*"}
+
+# RadioModel's module tree -> the released C-RADIO checkpoint's, i.e. every
+# WeightRenaming in register_radio_conversion_mapping() read right-to-left.
+# Applied as an ordered prefix substitution on the name below `vision_model.`,
+# because that is how transformers applies the forward direction.
+#
+# `summary_idxs` is deliberately absent: the mapping renames
+# `radio_model.summary_idxs` -> `summary_idxs`, but this checkpoint already
+# stores it at `vision_model.summary_idxs`, so for these weights that rule is a
+# no-op and the name passes through.
+_VISION_RENAMES = (
+    ("embeddings.video_patch_projection", "radio_model.model.patch_generator.video_embedder"),
+    ("embeddings.patch_projection", "radio_model.model.patch_generator.embedder"),
+    ("embeddings.position_embedding", "radio_model.model.patch_generator.pos_embed"),
+    ("embeddings.cls_register_token", "radio_model.model.patch_generator.cls_token.token"),
+    ("encoder.layer", "radio_model.model.blocks"),
+    ("input_conditioner", "radio_model.input_conditioner"),
+)
+
+# Inside a block, the attention rewrite. norm1/norm2/mlp.fc1/mlp.fc2 are
+# unrenamed on purpose -- RadioLayer spells them the same way timm does
+# (modeling_radio.py:370-381), which is why the registered mapping lists no
+# rule for them.
+_VISION_BLOCK_RENAMES = (("attention.output.dense", "attn.proj"),)
+
+
+def _vision_config(hf_config):
+    vision_config = getattr(hf_config, "vision_config", None)
+    if vision_config is None:
+        raise KeyError("Nemotron omni config has no vision_config")
+    return vision_config
+
+
+def _vision_tensor(rest: str, reader: SafetensorReader, hf_config) -> torch.Tensor:
+    """Resolve one RadioModel parameter name against the C-RADIO checkpoint."""
+
+    # LayerScale is the one parameter with no checkpoint counterpart at all.
+    # C-RADIO ViT-H has no layerscale, but RadioLayer builds one unconditionally
+    # (modeling_radio.py:372,381) as `layerscale_value * ones(hidden_size)`, and
+    # layerscale_value is 1.0 here -- so `hidden_state * lambda1` is the
+    # identity and the reference model loads with these as missing keys left at
+    # their init value. Synthesising that value is what keeps the two models
+    # numerically equal; raising here, or loading zeros, would not.
+    if re.fullmatch(r"encoder\.layer\.\d+\.layer_scale[12]\.lambda1", rest):
+        vision_config = _vision_config(hf_config)
+        return torch.full(
+            (vision_config.hidden_size,),
+            float(vision_config.layerscale_value),
+            dtype=torch.float32,
+        )
+
+    for source, target in _VISION_RENAMES:
+        if rest == source or rest.startswith(f"{source}."):
+            rest = target + rest[len(source) :]
+            break
+
+    block_match = re.fullmatch(r"(radio_model\.model\.blocks\.\d+\.)(.+)", rest)
+    if block_match:
+        block, inner = block_match.groups()
+        # Fused qkv: one checkpoint tensor feeds three Megatron parameters, so
+        # this is a Chunk(dim=0) rather than a rename. Both .weight and .bias
+        # split the same way (qkv_bias is true for this tower).
+        qkv_match = re.fullmatch(r"attention\.attention\.(query|key|value)\.(weight|bias)", inner)
+        if qkv_match:
+            component, suffix = qkv_match.groups()
+            fused = reader.get_tensor(f"vision_model.{block}attn.qkv.{suffix}")
+            chunks = torch.chunk(fused, 3, dim=0)
+            return chunks[("query", "key", "value").index(component)].contiguous()
+
+        for source, target in _VISION_BLOCK_RENAMES:
+            if inner == source or inner.startswith(f"{source}."):
+                inner = target + inner[len(source) :]
+                break
+        rest = block + inner
+
+    return reader.get_tensor(f"vision_model.{rest}")
 
 
 def _language_config(hf_config):
@@ -98,7 +188,7 @@ def nemotron_h_vl_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> t
     name = strip_mcore_wrappers(name)
 
     if name.startswith("vision_model."):
-        return reader.get_tensor(name)
+        return _vision_tensor(name[len("vision_model.") :], reader, hf_config)
 
     if name.startswith("vision_projector."):
         rest = name[len("vision_projector.") :]
