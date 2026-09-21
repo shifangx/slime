@@ -1,12 +1,35 @@
 # Nemotron 3.5 Super VL: direct RL preview
 
-This recipe reuses the native Nemotron provider, checkpoint conversion and full
+This recipe uses public MCore's HybridModel, native checkpoint conversion and full
 weight synchronization. It starts RL from an existing BF16 HF checkpoint; SFT is
 not a prerequisite. The vision encoder is frozen, while the projector and
 language model are trained.
 
 This is a candidate recipe, not a GPU-qualified configuration. Validate the same
 checkpoint on HF, Megatron and SGLang before interpreting rewards or loss.
+
+## Model ownership and public reuse
+
+- **Language:** directly construct MCore `HybridModel` with its public
+  `hybrid_stack_spec` and `--hybrid-layer-pattern`. MCore implements the
+  Mamba/attention/MoE stack, forward/loss-mask handling and parameter sharding.
+  The slime provider only binds arguments; there is no legacy MambaModel subclass
+  or old-MCore compatibility branch.
+- **Vision:** retain Shifang's slime adapter around the checkpoint's HF
+  `RadioModel` and Super VL `VisionProjector`. Slime owns image-feature injection,
+  ragged-input handling and the frozen-encoder/trainable-projector boundary; it
+  does not implement another RADIO or projector network.
+- **Bridge:** use the [public Nemotron-H mappings](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/ea5dded83078cf7e61ef91960273053cf564d5ac/src/megatron/bridge/models/nemotronh/nemotron_h_bridge.py)
+  and [public Super VL implementation](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/5b5ef52d3a673d5f867794c27035171680b23a9f/src/megatron/bridge/models/nemotron_omni/nemotron_omni_bridge.py)
+  as configuration/layout references. They are not runtime imports or a second
+  training backend. Bridge's MCore-native vision layout and its two-depth MTP
+  provider are not drop-in replacements for this image-only, no-MTP HF adapter.
+
+The existing slime checkpoint/refit adapters bridge the concrete HF parameter
+names and the already-gathered Megatron tensors. Full vision synchronization
+retains RADIO LayerScale; the HF projector's final LayerNorm remains trainable
+along with the rest of the projector. Do not silently change that freeze boundary
+when comparing with a Bridge recipe.
 
 ## Environment and scope
 

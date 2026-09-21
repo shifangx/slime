@@ -11,7 +11,7 @@ MODEL_ARGS=(
    --trust-remote-code
 
    --is-hybrid-model
-   --hybrid-override-pattern "${N35VL_HYBRID_PATTERN}"
+   --hybrid-layer-pattern "${N35VL_HYBRID_PATTERN}"
    --mamba-num-heads 128
    --mamba-head-dim 64
    --mamba-state-dim 128

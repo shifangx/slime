@@ -4,6 +4,9 @@ Model/mapping cases reuse Shifang's implementation; no real checkpoint is loaded
 The plugin execution test additionally requires an importable MCore environment.
 """
 
+import importlib.util
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +33,54 @@ CONFIG = SimpleNamespace(
 class Reader(dict):
     def get_tensor(self, name):
         return self[name]
+
+
+def test_provider_uses_public_hybrid_model_directly(monkeypatch):
+    """Check the adapter's constructor contract without initializing a GPU model."""
+    stack_spec = object()
+
+    class HybridModelSpy:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    for module_name, module in {
+        "hybrid_layer_allocation": SimpleNamespace(get_hybrid_total_layer_count=len),
+        "hybrid_layer_specs": SimpleNamespace(hybrid_stack_spec=stack_spec),
+        "hybrid_model": SimpleNamespace(HybridModel=HybridModelSpy),
+    }.items():
+        monkeypatch.setitem(sys.modules, f"megatron.core.models.hybrid.{module_name}", module)
+
+    path = Path(__file__).resolve().parents[1] / "slime_plugins/models/nemotron_h.py"
+    spec = importlib.util.spec_from_file_location("nemotron_main_provider_probe", path)
+    provider_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(provider_module)
+    args = SimpleNamespace(
+        hybrid_layer_pattern="M*E",
+        num_layers=3,
+        padded_vocab_size=128,
+        max_position_embeddings=512,
+        fp16_lm_cross_entropy=False,
+        untie_embeddings_and_output_weights=True,
+        position_embedding_type="none",
+        rotary_percent=1.0,
+        rotary_base=10000,
+    )
+    config = SimpleNamespace(is_hybrid_model=True)
+    build = provider_module.get_nemotron_h_spec(args, config, scatter_embedding_sequence_parallel=False)
+    model = build(pre_process=True, post_process=False)
+
+    assert type(model) is HybridModelSpy
+    assert model.kwargs["config"] is config
+    assert model.kwargs["hybrid_stack_spec"] is stack_spec
+    assert model.kwargs["hybrid_layer_pattern"] == "M*E"
+    assert model.kwargs["scatter_embedding_sequence_parallel"] is False
+    assert model.kwargs["post_process"] is False
+    assert "mamba_stack_spec" not in model.kwargs
+    with pytest.raises(ValueError, match="virtual pipeline"):
+        build(vp_stage=1)
+    args.num_layers = 2
+    with pytest.raises(ValueError, match="pattern has 3 layers"):
+        provider_module.get_nemotron_h_spec(args, config)
 
 
 @pytest.mark.parametrize(
@@ -112,7 +163,7 @@ def test_router_buffer_is_fp32_before_hf_copy():
 def test_cp1_odd_length_and_frozen_encoder_keep_projector_gradients(monkeypatch):
     # Importing core alone does not establish that its model dependencies
     # (e.g. Triton in the training environment) are available on a CPU host.
-    pytest.importorskip("megatron.core.models.mamba", exc_type=ImportError)
+    pytest.importorskip("megatron.core.models.hybrid.hybrid_model", exc_type=ImportError)
     from slime_plugins.models import nemotron_35_super_vl as plugin
 
     def reject_cp_indices(*args):

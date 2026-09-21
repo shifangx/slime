@@ -1,7 +1,7 @@
 """Nemotron 3.5 Super VL with a frozen HF RADIO and trainable projector/LLM.
 
-Reuses Shifang\'s provider from shifangx/slime@328760de. Vision/projector are
-checkpoint-owned Transformers modules; the language tower uses MCore\'s hybrid
+Reuses Shifang's vision adapter from shifangx/slime@328760de. Vision/projector are
+checkpoint-owned Transformers modules; the language tower uses MCore's HybridModel
 stack. Image features are injected before sequence-parallel scatter.
 """
 
@@ -266,7 +266,7 @@ class NemotronOmniVLModel(MegatronModule):
         # The processor returns these next to `pixel_values` and slime forwards
         # whatever it returned. They are metadata -- the projector reads the
         # grid off `pixel_values.shape` -- so they are named here only so they
-        # do not fall into **kwargs and get passed down to MambaModel, which
+        # do not fall into **kwargs and get passed down to HybridModel, which
         # would raise on the first microbatch.
         num_patches=None,
         # Processor metadata, consumed here rather than forwarded to MCore.
@@ -297,7 +297,7 @@ class NemotronOmniVLModel(MegatronModule):
                 num_tokens,
             )
 
-        # position_ids stays whatever it was -- NoPE, so MambaModel's embedding
+        # position_ids stays whatever it was -- NoPE, so HybridModel's embedding
         # never reads it and there is no mrope construction to do. This is the
         # exact opposite of Qwen3.5-VL, which has to build interleaved T/H/W
         # position ids here.
