@@ -136,14 +136,38 @@ def get_batch(
     # Process multimodal training tensors if present
     multimodal_train_inputs = batch.get("multimodal_train_inputs", None)
     if multimodal_train_inputs is not None:
-        multimodal_data = {}  # key -> concatenated tensor
+        grouped: dict[str, list] = {}
         for mm_input_dict in multimodal_train_inputs:
             if mm_input_dict is not None:
                 for key, mm_tensor in mm_input_dict.items():
-                    if key not in multimodal_data:
-                        multimodal_data[key] = mm_tensor
-                    else:
-                        multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)
+                    grouped.setdefault(key, []).append(mm_tensor)
+
+        multimodal_data = {}  # key -> concatenated tensor, or a per-sample list
+        for key, tensors in grouped.items():
+            if len(tensors) == 1:
+                multimodal_data[key] = tensors[0]
+                continue
+            # Concatenating along dim 0 requires every other dimension to
+            # agree. It does for a tower whose processor emits ragged-packed
+            # patches -- Qwen-VL's pixel_values is (total_patches, patch_dim),
+            # where only dim 0 varies. It does not for a tower that keeps
+            # images as pictures at their own resolution: Nemotron's
+            # pixel_values is (tiles, 3, H, W) with H and W set per image by
+            # dynamic tiling, so two samples in one micro-batch produce e.g.
+            # 416 and 384 and torch.cat raises.
+            #
+            # Hand those through as the per-sample list instead. The model is
+            # what knows how to consume its own tower's layout, and Nemotron's
+            # projector already iterates a list (its forward recurses on
+            # list/tuple). Keys that do concatenate still do: num_patches,
+            # num_tokens and imgs_sizes are all (1, ...) per sample.
+            first_trailing = tensors[0].shape[1:] if hasattr(tensors[0], "shape") else None
+            if first_trailing is not None and all(
+                hasattr(t, "shape") and t.shape[1:] == first_trailing for t in tensors
+            ):
+                multimodal_data[key] = torch.cat(tensors, dim=0)
+            else:
+                multimodal_data[key] = tensors
         batch["multimodal_train_inputs"] = multimodal_data
 
     return batch

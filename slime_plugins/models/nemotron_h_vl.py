@@ -181,10 +181,19 @@ class NemotronHVLModel(MegatronModule):
         # The projector owns the whole pipeline -- tower, LayerNorm, pixel
         # shuffle, mlp1 -- and takes the tower as an argument, exactly as the
         # reference model calls it.
-        vision_output = self.vision_projector(
-            pixel_values.to(dtype=next(self.vision_projector.parameters()).dtype),
-            self.vision_model,
-        )
+        #
+        # pixel_values arrives as a list when the micro-batch holds images of
+        # different resolutions, because this tower keeps them as pictures
+        # rather than ragged-packed patches and they do not concatenate
+        # (backends/megatron_utils/data.py). The projector's own forward
+        # recurses on list/tuple and concatenates the per-image outputs, so the
+        # only thing to do here is cast each entry.
+        projector_dtype = next(self.vision_projector.parameters()).dtype
+        if isinstance(pixel_values, (list, tuple)):
+            pixel_values = [image.to(dtype=projector_dtype) for image in pixel_values]
+        else:
+            pixel_values = pixel_values.to(dtype=projector_dtype)
+        vision_output = self.vision_projector(pixel_values, self.vision_model)
         vision_embeddings = vision_output.reshape(-1, vision_output.shape[-1]).to(
             device=embeddings.device, dtype=embeddings.dtype
         )
@@ -226,7 +235,7 @@ class NemotronHVLModel(MegatronModule):
         labels: torch.Tensor | None = None,
         packed_seq_params: PackedSeqParams | None = None,
         loss_mask: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | list[torch.Tensor] | None = None,
         # The processor also emits num_patches / num_tokens / imgs_sizes, which
         # slime forwards verbatim from multimodal_train_inputs. The projector
         # derives the same facts from pixel_values itself, so they are accepted
