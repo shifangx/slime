@@ -176,8 +176,26 @@ def test_raw_loader_shards_swiglu_and_grouped_moe_fc2():
         parallel_rank=1,
         partition_dim=0,
         partition_stride=1,
+        gated_mlp=True,
     )
     assert torch.equal(fc1_shard, torch.cat((fc1[2:4], fc1[6:8])))
+
+    # The same tensor under a NON-gated MLP is one projection, not
+    # cat(gate, up), so rank 1 takes the second half outright. Splitting it as
+    # gate+up returns a tensor of exactly the right shape holding the wrong
+    # rows, which is why it survived 40 MoE layers unnoticed --
+    # Scripts-Slime/docs/06 section 7.
+    fc1_ungated = _tensor_parallel_shard(
+        "module.module.language_model.decoder.layers.0.mlp.shared_experts.linear_fc1.weight",
+        fc1,
+        parallel_size=2,
+        parallel_rank=1,
+        partition_dim=0,
+        partition_stride=1,
+        gated_mlp=False,
+    )
+    assert torch.equal(fc1_ungated, fc1[4:8])
+    assert not torch.equal(fc1_ungated, fc1_shard)
 
     fc2 = torch.arange(4 * 6).reshape(4, 6)
     fc2_shard = _tensor_parallel_shard(
@@ -187,6 +205,7 @@ def test_raw_loader_shards_swiglu_and_grouped_moe_fc2():
         parallel_rank=1,
         partition_dim=0,
         partition_stride=1,
+        gated_mlp=True,
     )
     assert torch.equal(fc2_shard, fc2[:, 3:])
 
