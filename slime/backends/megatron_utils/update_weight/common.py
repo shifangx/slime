@@ -8,10 +8,11 @@ import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+from slime.backends.megatron_utils.misc_utils import has_gated_linear_unit
 from slime.utils.types import ParamInfo
 
 
-def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
+def all_gather_param(args: Namespace, name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """
     All-gather TP-sharded param to full tensor. expert_bias→param,
     non-TP/duplicated/TP-size-1→param.data.
@@ -44,8 +45,12 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
         param.partition_stride == 2 and "linear_fc1" in name
     ), "partition_stride != 1 is not supported"
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-    # TODO: check only GLU is used.
-    if "linear_fc1.weight" in name or "linear_fc1.bias" in name:
+    # De-interleave cat(gate, up) -- but only for a model that HAS a gate half.
+    # This is the exact mirror of hf_to_megatron/common.py's shard, and the two
+    # must agree: loading wrongly and gathering wrongly cancelled for ungated
+    # models, so fixing either one alone permutes the rows on the way to the
+    # engine. See Scripts-Slime/docs/06 section 9.
+    if has_gated_linear_unit(args) and ("linear_fc1.weight" in name or "linear_fc1.bias" in name):
         param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
         param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
     # this is bug in megatron's grouped moe.
@@ -57,6 +62,7 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
 
 
 def all_gather_params_async(
+    args: Namespace,
     param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
 ) -> list[torch.Tensor]:
     """
@@ -111,8 +117,8 @@ def all_gather_params_async(
             # Process the gathered partitions (same logic as original all_gather_param)
             assert partition_dim is not None, "partition_stride != 1 is not supported"
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
-            # TODO: check only GLU is used.
-            if "linear_fc1.weight" in info.name or "linear_fc1.bias" in info.name:
+            # Same gated-only de-interleave as all_gather_param above.
+            if has_gated_linear_unit(args) and ("linear_fc1.weight" in info.name or "linear_fc1.bias" in info.name):
                 param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
                 param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
             # this is bug in megatron's grouped moe.
