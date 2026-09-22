@@ -29,9 +29,17 @@ here would be transcribing semantics that the checkpoint already ships. The
 weight names then match the checkpoint too, which is what lets
 ``hf_to_megatron/nemotron_h_vl.py`` stay a thin dispatcher.
 
-Unlike Qwen3.5-VL this model does *not* use mrope: only the 8 attention layers
-in the hybrid stack use positions at all, and they use plain rope. So there is
-no position-id rebuild here -- ``position_ids`` passes straight through.
+Unlike Qwen3.5-VL this model does *not* use mrope, and it does not use rope
+either: the 8 attention layers in the hybrid stack are NoPE. SGLang's
+``nemotron_h.py`` has no rotary embedding at all -- ``NemotronHAttention.forward``
+is ``qkv_proj -> RadixAttention -> o_proj`` and takes no ``positions`` argument
+-- and neither does the checkpoint's ``modeling_nemotron_h.py``. ``config.json``
+still carries ``rope_theta`` and ``partial_rotary_factor``; nothing reads them,
+and configuring ``--position-embedding-type rope`` off the back of them is what
+put ``train_rollout_logprob_abs_diff`` at 2.3 against slime's 0.1 bound (see
+``Scripts-Slime/docs/06_train_rollout_logprob_abs_diff_debug_plan.md``). So
+there is no position-id rebuild here -- ``position_ids`` passes straight
+through, into an embedding that ignores it under ``none``.
 
 Usage (see scripts/models/nemotron3.5-super-vl.sh):
 
