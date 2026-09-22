@@ -34,9 +34,16 @@ MODEL_ARGS=(
    --disable-bias-linear                   # use_bias / attention_bias / mlp_bias: false
    --normalization RMSNorm
    --norm-epsilon 1e-5                     # norm_eps / layer_norm_epsilon
-   --position-embedding-type rope
-   --rotary-base 10000                     # rope_theta
-   --rotary-percent 1.0                    # partial_rotary_factor
+   # NoPE. config.json still carries rope_theta 10000 and
+   # partial_rotary_factor 1.0, but nothing reads them: SGLang's nemotron_h.py
+   # has no rotary embedding at all -- NemotronHAttention.forward goes
+   # qkv_proj -> RadixAttention -> o_proj and never sees positions -- and
+   # neither does the checkpoint's own modeling_nemotron_h.py. Configuring
+   # `rope` here made the trainer a different model from the engine and put
+   # train_rollout_logprob_abs_diff at 2.3 against slime's 0.1 bound, with
+   # entropy_loss at 0.75 against 0.16. See
+   # Scripts-Slime/docs/06_train_rollout_logprob_abs_diff_debug_plan.md.
+   --position-embedding-type none
 
    # ---------------------------------------------------------------- mamba --
    # in_proj packs [z, x, B, C, dt]: 2*d_inner + 2*n_groups*d_state + nheads
