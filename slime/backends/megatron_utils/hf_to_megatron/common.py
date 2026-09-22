@@ -83,23 +83,6 @@ def merge_gate_up(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return torch.cat((gate, up), dim=0)
 
 
-def _is_gated_mlp(args) -> bool:
-    """Whether `linear_fc1` packs `cat(gate, up)` rather than one projection.
-
-    This is the same condition Megatron itself uses to set
-    `gated_linear_unit` on the transformer config
-    (`megatron/training/argument_utils.py:314-325`): `--swiglu` or
-    `--quick-geglu`, and `--squared-relu` asserts the first is off.
-
-    It has to be asked, because the name cannot answer it. A non-gated MLP's
-    `linear_fc1` is a single projection whose row count divides evenly by the
-    TP size, so splitting it in half as if it were gate+up produces a tensor of
-    exactly the right shape holding the wrong rows -- see
-    Scripts-Slime/docs/06 section 7 for the 40-layer instance of that.
-    """
-    return bool(getattr(args, "swiglu", False) or getattr(args, "quick_geglu", False))
-
-
 def _tensor_parallel_shard(
     name: str,
     tensor: torch.Tensor,
@@ -108,19 +91,11 @@ def _tensor_parallel_shard(
     parallel_rank: int,
     partition_dim: int,
     partition_stride: int,
-    gated_mlp: bool,
 ) -> torch.Tensor:
     if parallel_size == 1:
         return tensor
 
-    if gated_mlp and ("linear_fc1.weight" in name or "linear_fc1.bias" in name):
-        if tensor.shape[partition_dim] % 2 != 0:
-            raise ValueError(
-                f"{name!r} is being sharded as a gated cat(gate, up), but its "
-                f"partition dim is {tensor.shape[partition_dim]}, which is odd. "
-                "Either the model is not gated (check --swiglu / --quick-geglu) "
-                "or the tensor is not linear_fc1."
-            )
+    if "linear_fc1.weight" in name or "linear_fc1.bias" in name:
         gate, up = tensor.chunk(2, dim=partition_dim)
         gate = torch.chunk(gate, parallel_size, dim=partition_dim)[parallel_rank]
         up = torch.chunk(up, parallel_size, dim=partition_dim)[parallel_rank]
@@ -133,7 +108,7 @@ def _tensor_parallel_shard(
     return torch.cat(chunks[parallel_rank::parallel_size], dim=partition_dim).contiguous()
 
 
-def shard_mcore_tensor(args, name: str, tensor: torch.Tensor, parameter: torch.Tensor) -> torch.Tensor:
+def shard_mcore_tensor(name: str, tensor: torch.Tensor, parameter: torch.Tensor) -> torch.Tensor:
     from megatron.core import mpu
 
     if (
@@ -142,11 +117,6 @@ def shard_mcore_tensor(args, name: str, tensor: torch.Tensor, parameter: torch.T
     ):
         return tensor
 
-    # `.experts.` and not `experts.`: `shared_experts` carries an underscore
-    # before the word, so it does NOT match here and is sharded over the dense
-    # TP group. That is correct -- MCore builds SharedExpertMLP with
-    # `tp_group=pg_collection.tp` (transformer/moe/shared_experts.py) -- and it
-    # is also why a shared expert feels TP while routed experts feel ETP.
     if ".experts." in name:
         parallel_size = mpu.get_expert_tensor_parallel_world_size()
         parallel_rank = mpu.get_expert_tensor_parallel_rank()
@@ -161,7 +131,6 @@ def shard_mcore_tensor(args, name: str, tensor: torch.Tensor, parameter: torch.T
         parallel_rank=parallel_rank,
         partition_dim=parameter.partition_dim,
         partition_stride=parameter.partition_stride,
-        gated_mlp=_is_gated_mlp(args),
     )
 
 
@@ -189,7 +158,7 @@ def load_model_hf_weights(
             tensor = get_hf_tensor(name, reader, config)
             if name.endswith("output_layer.weight") and parameter.shape[0] == 1 and tensor.shape[0] != 1:
                 continue
-            tensor = shard_mcore_tensor(args, name, _pad_vocab(args, name, tensor), parameter)
+            tensor = shard_mcore_tensor(name, _pad_vocab(args, name, tensor), parameter)
             if tensor.shape != parameter.shape:
                 raise ValueError(
                     f"Shape mismatch loading {name}: HuggingFace {tuple(tensor.shape)}, "
