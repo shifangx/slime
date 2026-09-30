@@ -1,8 +1,8 @@
 From 535487a0c539fdaf7d5e786bb52ef672426312b0 Mon Sep 17 00:00:00 2001
 From: shifangx <shifangx@nvidia.com>
 Date: Mon, 21 Sep 2026 16:11:35 -0700
-Subject: [PATCH] feat(nemotron): serve Nemotron 3.5 Super VL, LayerNorm and
- all
+Subject: [PATCH 1/2] feat(nemotron): serve Nemotron 3.5 Super VL, LayerNorm
+ and all
 
 Super checkpoints declare architecture NemotronH_Omni_Reasoning_V3 and
 model_type nemotron_h_omni; only the Nano_ spellings were registered, so
@@ -50,7 +50,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  6 files changed, 149 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/configs/__init__.py b/python/sglang/srt/configs/__init__.py
-index aa05b73be721ab78e4c2f6ffa3f472041400073e..4e19327e327747f6258ec8862e3300281056e78a 100644
+index aa05b73be..4e19327e3 100644
 --- a/python/sglang/srt/configs/__init__.py
 +++ b/python/sglang/srt/configs/__init__.py
 @@ -27,6 +27,7 @@ from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionC
@@ -70,7 +70,7 @@ index aa05b73be721ab78e4c2f6ffa3f472041400073e..4e19327e327747f6258ec8862e330028
      "JetVLMConfig",
      "Step3p5Config",
 diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
-index debcc7f535740b5405fa898a50c75c7c2aa0a508..fa8dab9934c9c39310119adc9fa211624d9e32de 100644
+index debcc7f53..fa8dab993 100644
 --- a/python/sglang/srt/configs/model_config.py
 +++ b/python/sglang/srt/configs/model_config.py
 @@ -1665,6 +1665,7 @@ multimodal_model_archs = [
@@ -82,7 +82,7 @@ index debcc7f535740b5405fa898a50c75c7c2aa0a508..fa8dab9934c9c39310119adc9fa21162
      "Qwen2AudioForConditionalGeneration",
      "Qwen2VLForConditionalGeneration",
 diff --git a/python/sglang/srt/configs/nano_nemotron_vl.py b/python/sglang/srt/configs/nano_nemotron_vl.py
-index 888f94a1b43371ad587ec845393aef08a35ce30b..d947be9a11a6dc03a26d4e1ee7c2148b456eb578 100644
+index 888f94a1b..d947be9a1 100644
 --- a/python/sglang/srt/configs/nano_nemotron_vl.py
 +++ b/python/sglang/srt/configs/nano_nemotron_vl.py
 @@ -166,3 +166,28 @@ class NemotronH_Nano_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
@@ -115,7 +115,7 @@ index 888f94a1b43371ad587ec845393aef08a35ce30b..d947be9a11a6dc03a26d4e1ee7c2148b
 +        # Explicit __init__, same reason as above.
 +        super().__init__(*args, **kwargs)
 diff --git a/python/sglang/srt/models/nano_nemotron_vl.py b/python/sglang/srt/models/nano_nemotron_vl.py
-index bfd6cc128ac0e15d65cb1b8f490396d9b8cb055b..9b1e8ebc2073179041f265306261139ecc034cd2 100644
+index bfd6cc128..9b1e8ebc2 100644
 --- a/python/sglang/srt/models/nano_nemotron_vl.py
 +++ b/python/sglang/srt/models/nano_nemotron_vl.py
 @@ -176,6 +176,17 @@ class NemotronH_Nano_VL_V2(EVS):
@@ -263,7 +263,7 @@ index bfd6cc128ac0e15d65cb1b8f490396d9b8cb055b..9b1e8ebc2073179041f265306261139e
 +    NemotronH_Omni_Reasoning_V3,
 +]
 diff --git a/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py b/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
-index 32bab7ae44709e6fa6653b21aae8c3f55d927e85..9060d13a253de9c74610866b56eccf4113f9998a 100644
+index 32bab7ae4..9060d13a2 100644
 --- a/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
 +++ b/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
 @@ -22,6 +22,7 @@ from PIL import Image
@@ -304,7 +304,7 @@ index 32bab7ae44709e6fa6653b21aae8c3f55d927e85..9060d13a253de9c74610866b56eccf41
          )
          Image.MAX_IMAGE_PIXELS = None
 diff --git a/python/sglang/srt/utils/hf_transformers/common.py b/python/sglang/srt/utils/hf_transformers/common.py
-index eef80dc7a98508e7cb9974ef1979282309665725..4b1ede4cb8e49471cd5dc299c8cf836b52011573 100644
+index eef80dc7a..4b1ede4cb 100644
 --- a/python/sglang/srt/utils/hf_transformers/common.py
 +++ b/python/sglang/srt/utils/hf_transformers/common.py
 @@ -46,6 +46,7 @@ from sglang.srt.configs import (
@@ -323,6 +323,185 @@ index eef80dc7a98508e7cb9974ef1979282309665725..4b1ede4cb8e49471cd5dc299c8cf836b
          NemotronHConfig,
          NemotronHPuzzleConfig,
          DeepseekVLV2Config,
+-- 
+2.34.1
+
+
+From 98079a424f8ca8bd2c44d63a616ae626750572b0 Mon Sep 17 00:00:00 2001
+From: shifangx <shifangx@nvidia.com>
+Date: Tue, 29 Sep 2026 22:02:13 -0700
+Subject: [PATCH 2/2] feat(nemotron-vl): serve the MTP block as an EAGLE draft
+
+The Nemotron-H VL checkpoints carry the same Multi-Token Prediction block their
+text siblings do, but nothing could reach it: the draft-model architecture swap
+had no entry for them, so --speculative-algorithm EAGLE could not resolve a
+draft model at all.
+
+Three changes, and only two of them were obvious.
+
+configs/model_config.py
+  NemotronH_Omni_Reasoning_V3 and NemotronH_Nano_VL_V2 swap to
+  NemotronHVLForCausalLMMTP. A separate block from the text entry because the
+  draft class differs, and no num_nextn_predict_layers override because on
+  these configs it lives on the nested llm_config, where the checkpoint already
+  sets it.
+
+models/nemotron_h_mtp.py
+  NemotronHVLForCausalLMMTP(NemotronHForCausalLMMTP). The draft is a pure
+  language model -- EAGLE's draft forward consumes
+  forward_batch.spec_info.hidden_states and never touches pixels -- so the whole
+  difference is where the config and the weight names live: unwrap
+  config.llm_config, and rewrite the checkpoint's language_model. prefix.
+
+  The rewrite goes through remap_prefix, the mechanism the parent already
+  applies, rather than wrapping the weight iterator. Order is load-bearing:
+  replace_prefix applies every matching rule in turn rather than stopping at
+  the first, so language_model.backbone has to be consumed before the bare
+  language_model.. Vision keys need no rule -- the parent's is_mtp filter drops
+  every name without mtp in it, which is exactly the set a language draft does
+  not own.
+
+models/nano_nemotron_vl.py
+  get_embed_and_head() / set_embed_and_head(), delegating to the nested
+  language model. This is the one that is easy to miss: EAGLE calls
+  get_embed_and_head on the *target* while wiring the draft up
+  (speculative/eagle_worker_v2.py:328), NemotronHForCausalLM defines it so the
+  draft inherits it, but the VL target class defined neither -- so the
+  speculative path raised AttributeError on the target several minutes into
+  engine startup, after the swap had already succeeded.
+
+  It also explains why the draft's own load_weights never loads an embedding:
+  is_mtp drops backbone.embeddings.weight, and that is correct rather than a
+  bug, because NemotronHMultiTokenPredictor asserts "embed_tokens not
+  initialized - must be shared from target model". The embedding arrives over
+  this path.
+
+Verified offline against the real checkpoint index: language_model.mtp.* keys
+remap to mtp.* and survive the is_mtp filter, backbone and vision keys are
+dropped, the text model's own remap is unchanged, and the method-resolution
+chain gives the target get_embed_and_head and the draft set_embed_and_head.
+
+Not verified by running. A draft with wrong weights does not raise -- sglang's
+loader drops names it does not recognise -- it simply never gets accepted, so
+the number that settles this is the accept rate against a no-speculation run
+over the same prompts, not the absence of a traceback.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ python/sglang/srt/configs/model_config.py    | 11 +++++
+ python/sglang/srt/models/nano_nemotron_vl.py | 17 +++++++
+ python/sglang/srt/models/nemotron_h_mtp.py   | 51 +++++++++++++++++++-
+ 3 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index fa8dab993..42d286d66 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -616,6 +616,17 @@ class ModelConfig:
+             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
+             self.hf_config.num_nextn_predict_layers = 1
+ 
++        # The VL siblings of the above. A separate entry because the draft is a
++        # pure language model while this config nests one: the draft class
++        # unwraps llm_config and strips the checkpoint's language_model. prefix,
++        # which NemotronHForCausalLMMTP does not do. num_nextn_predict_layers
++        # lives on the nested config here, and the checkpoint already sets it.
++        if is_draft_model and self.hf_config.architectures[0] in [
++            "NemotronH_Omni_Reasoning_V3",
++            "NemotronH_Nano_VL_V2",
++        ]:
++            self.hf_config.architectures[0] = "NemotronHVLForCausalLMMTP"
++
+         if is_draft_model and self.hf_config.architectures[0] == "HYV3ForCausalLM":
+             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
+             self.hf_config.num_nextn_predict_layers = 1
+diff --git a/python/sglang/srt/models/nano_nemotron_vl.py b/python/sglang/srt/models/nano_nemotron_vl.py
+index 9b1e8ebc2..b8d7a2f2f 100644
+--- a/python/sglang/srt/models/nano_nemotron_vl.py
++++ b/python/sglang/srt/models/nano_nemotron_vl.py
+@@ -228,6 +228,23 @@ class NemotronH_Nano_VL_V2(EVS):
+     def get_input_embeddings(self):
+         return self.language_model.get_input_embeddings()
+ 
++    def get_embed_and_head(self):
++        """The tensors EAGLE hands to its draft (``eagle_worker_v2.py:328``).
++
++        Delegated, because on this family the embedding and the head belong to
++        the nested language model -- the draft is a pure language model and
++        never sees the vision half. Without this the speculative path raises
++        AttributeError on the *target* during draft setup, before any
++        mis-drafting could show up as a low acceptance rate.
++        """
++        return self.language_model.get_embed_and_head()
++
++    def set_embed_and_head(self, embed, head):
++        """The inverse, for completeness: this class is a target rather than a
++        draft, but the pair is looked up by name and keeping them together is
++        what stops the next reader from wondering which half is missing."""
++        return self.language_model.set_embed_and_head(embed, head)
++
+     def extract_feature(self, pixel_values):
+         micro_batch_size = 128
+         n = pixel_values.shape[0]
+diff --git a/python/sglang/srt/models/nemotron_h_mtp.py b/python/sglang/srt/models/nemotron_h_mtp.py
+index 189e364b9..330f79a17 100644
+--- a/python/sglang/srt/models/nemotron_h_mtp.py
++++ b/python/sglang/srt/models/nemotron_h_mtp.py
+@@ -371,4 +371,53 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
+         super().load_weights(weights, is_mtp=True)
+ 
+ 
+-EntryClass = [NemotronHForCausalLMMTP]
++class NemotronHVLForCausalLMMTP(NemotronHForCausalLMMTP):
++    """The EAGLE draft for the Nemotron-H *VL* checkpoints.
++
++    The draft is a pure language model: EAGLE's draft forward consumes
++    ``forward_batch.spec_info.hidden_states`` and never touches pixels. So the
++    whole difference from the text draft is where the config and the weight
++    names live.
++
++    Config: these checkpoints nest the language model as ``llm_config`` (a
++    ``NemotronHConfig``, see ``configs/nano_nemotron_vl.py:74``), so it is
++    unwrapped here. ``mtp_layers_block_type`` defaults to attention-then-MoE,
++    which is what the Nemotron 3.5 Super checkpoint serializes -- one ``*E``
++    block, ``num_nextn_predict_layers: 1``.
++
++    Weights: everything the language model owns is stored under a
++    ``language_model.`` prefix. Rewriting the prefix rather than wrapping the
++    iterator keeps this on the mechanism the parent already uses, and the order
++    matters -- ``language_model.backbone`` has to be consumed before the bare
++    ``language_model.``, because ``replace_prefix`` applies every matching rule
++    in turn rather than stopping at the first.
++
++    The vision keys need no rule: nothing rewrites them, and the parent's
++    ``is_mtp`` filter drops every name without ``mtp`` in it
++    (``nemotron_h.py:1109-1111``), which is exactly the set a language draft
++    does not own.
++    """
++
++    remap_prefix = {
++        "language_model.backbone": "model",
++        "language_model.": "",
++        "backbone": "model",
++    }
++
++    def __init__(
++        self,
++        config,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++    ):
++        llm_config = getattr(config, "llm_config", None)
++        if llm_config is None:
++            raise ValueError(
++                f"{type(config).__name__} has no llm_config; "
++                "NemotronHVLForCausalLMMTP is for the VL checkpoints, whose language model "
++                "is nested. Use NemotronHForCausalLMMTP for the text ones."
++            )
++        super().__init__(llm_config, quant_config=quant_config, prefix=prefix)
++
++
++EntryClass = [NemotronHForCausalLMMTP, NemotronHVLForCausalLMMTP]
 -- 
 2.34.1
 
