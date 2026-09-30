@@ -21,16 +21,30 @@
 #     `--optimizer-cpu-offload --use-precision-aware-optimizer` instead.
 #   * the checkpoint's MTP block is TRAINED, at two prediction depths sharing
 #     one block (TRAIN_MTP=0 turns it off). The Qwen recipe has no such block.
-#     Watch train/mtp_1_loss and train/mtp_2_loss; on a first 4-node run they
-#     fell from 0.215/0.271 by 37%/29% over eighteen steps, and the block plus
-#     its fp32 Adam state fits -- 50.6 GB of 79.1 at EP32.
-#     This is training only; it does not change the rollout.
-#   * no MTP *speculative decoding*, which is the separate thing USE_MTP=1
-#     turns on. The option is real, but in the Qwen GRPO case SGLang returned a
-#     None inside meta_info["output_token_logprobs"] during eval, and GRPO
-#     needs a real log prob for every trainable response token. That hazard is
-#     unchanged, which is why training the block and drafting with it are two
-#     switches rather than one.
+#     Watch train/mtp_1_loss and train/mtp_2_loss. On a 4-node 2 h segment
+#     (27 steps, no errors), over steps 0 -> 20:
+#
+#         train/mtp_1_loss   0.2146 -> 0.1366   -36.3%
+#         train/mtp_2_loss   0.2703 -> 0.1922   -28.9%
+#         train/mtp_loss     0.4848 -> 0.3288   -32.2%  (-0.0096/step)
+#         logprob_abs_diff   0.0146 -> 0.0106   weight sync undisturbed
+#
+#     and the block plus its fp32 Adam state fits: 50.6 GB of 79.1 at EP32.
+#     Depth 2 stays the harder of the two throughout, which is the expected
+#     ordering. This is training only; it does not change the rollout.
+#   * the rollout also SPECULATES with that block (USE_MTP, which follows
+#     TRAIN_MTP). run-glm4.7-30B-A3B.sh does the same, unconditionally and in a
+#     GRPO loop. Measured on a rollout-only eval of all 601 prompts:
+#     spec_accept_length 2.639 of a maximum 3, eval 0.394 against a 0.406
+#     baseline -- inside noise at that n -- and unchanged response lengths, so
+#     the draft is accepted and does not change what the model says.
+#     The caveat that run cannot settle: it never reads
+#     meta_info["output_token_logprobs"], and the Qwen GRPO case's None-logprob
+#     failure was exactly there. glm4.7 shows the hazard is not universal;
+#     nothing yet shows it is absent here. USE_MTP=0 keeps training the block
+#     without drafting from it.
+#     --sglang-mem-fraction-static may need lowering: the draft is a second
+#     model on GPUs Megatron already shares, and 0.7 was chosen without it.
 #   * scripts/models/nemotron3.5-super-vl.sh, which sources the Nemotron 3 text
 #     config and overrides only --spec: the two models' language configs are
 #     field-for-field identical, and the spec is what hangs the C-RADIO v4-H
@@ -205,8 +219,8 @@ SGLANG_ARGS=(
    #   model's tower is C-RADIO v4-H, served by sglang's own radio.py.
 )
 
-# MTP speculative decoding, off by default -- see the header.
-if [ "${USE_MTP:-0}" = "1" ]; then
+# MTP speculative decoding, following TRAIN_MTP -- see the header.
+if [ "${USE_MTP:-${TRAIN_MTP}}" = "1" ]; then
    SGLANG_ARGS+=(
       --sglang-speculative-algorithm EAGLE
       --sglang-speculative-num-steps 2
