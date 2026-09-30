@@ -19,10 +19,18 @@
 #     stay resident at this size; micro-batch and recompute are already at their
 #     limits. This is mcore 0.16's spelling -- on 0.20 use
 #     `--optimizer-cpu-offload --use-precision-aware-optimizer` instead.
-#   * no MTP speculative decoding. The option is real (this checkpoint has an
-#     MTP layer), but in the Qwen GRPO case SGLang returned a None inside
-#     meta_info["output_token_logprobs"] during eval, and GRPO needs a real log
-#     prob for every trainable response token. USE_MTP=1 turns it back on.
+#   * the checkpoint's MTP block is TRAINED, at two prediction depths sharing
+#     one block (TRAIN_MTP=0 turns it off). The Qwen recipe has no such block.
+#     Watch train/mtp_1_loss and train/mtp_2_loss; on a first 4-node run they
+#     fell from 0.215/0.271 by 37%/29% over eighteen steps, and the block plus
+#     its fp32 Adam state fits -- 50.6 GB of 79.1 at EP32.
+#     This is training only; it does not change the rollout.
+#   * no MTP *speculative decoding*, which is the separate thing USE_MTP=1
+#     turns on. The option is real, but in the Qwen GRPO case SGLang returned a
+#     None inside meta_info["output_token_logprobs"] during eval, and GRPO
+#     needs a real log prob for every trainable response token. That hazard is
+#     unchanged, which is why training the block and drafting with it are two
+#     switches rather than one.
 #   * scripts/models/nemotron3.5-super-vl.sh, which sources the Nemotron 3 text
 #     config and overrides only --spec: the two models' language configs are
 #     field-for-field identical, and the spec is what hangs the C-RADIO v4-H
@@ -46,6 +54,30 @@ NUM_NODES=${SLIME_SCRIPT_NUM_NODES:-4}
 DATASET_LOCAL_NAME=$(basename "$DATASET_NAME")
 
 MODEL_NAME_LOWER=$(echo "$MODEL_NAME" | tr '[:upper:]' '[:lower:]')
+
+# MTP, on by default. TRAIN_MTP=0 turns it off; the rest are the knobs.
+#
+# Two prediction depths sharing ONE block. That pairing is not a preference:
+# the checkpoint serializes exactly one "*E" block
+# (num_nextn_predict_layers: 1), so an independent second depth would have no
+# weights to load into it, while a single depth would leave the checkpoint's
+# second prediction head untrained. It is also Megatron-Bridge's configuration
+# for this same checkpoint. MCore builds one layer object and calls it once per
+# depth into one main_grad, so depth 2 costs compute and activations but no
+# extra weights -- two runs at mtp_num_layers 1 and 2 reported an identical
+# 8,693,665,280 parameters per rank.
+#
+# --mtp-num-layers is added by scripts/models/nemotron3-super-120b-a12b.sh from
+# MTP_NUM_LAYERS, so that it lands inside MODEL_ARGS and precedes BACKEND_ARGS
+# on the command line.
+TRAIN_MTP="${TRAIN_MTP:-1}"
+if [ "${TRAIN_MTP}" = "1" ]; then
+   export MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-2}"
+fi
+export MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
+MTP_USE_REPEATED_LAYER="${MTP_USE_REPEATED_LAYER:-1}"
+MTP_LOSS_SCALING_FACTOR="${MTP_LOSS_SCALING_FACTOR:-0.2}"
+MTP_DETACH_HEADS="${MTP_DETACH_HEADS:-0}"
 
 # External Ray flag
 if [ -z "$SLIME_SCRIPT_EXTERNAL_RAY" ] || [ "$SLIME_SCRIPT_EXTERNAL_RAY" = "0" ]; then
@@ -225,6 +257,35 @@ BACKEND_ARGS=(
 
    --micro-batch-size 1
 )
+
+# MTP training, in the shape scripts/run-glm4.7-30B-A3B.sh:81-84 uses, plus
+# --mtp-use-repeated-layer, which glm4.7 does not need because GLM serializes
+# one block per depth and this checkpoint serializes one for both.
+#
+# What this loss IS: mtp_labels is the rollout's own sampled tokens, so it is a
+# next-token cross-entropy of the draft head against the policy's own samples.
+# Self-distillation, which is what keeps a draft aligned with a policy GRPO
+# moves every rollout.
+#
+# The gradient reaches the policy too, as it does in glm4.7: MTPLossAutoScaler
+# routes the MTP loss back through the shared backbone, so GRPO's gradient
+# picks up an auxiliary supervised term with a coefficient nobody has tuned on
+# this model. MTP_DETACH_HEADS=1 trains the head and only the head, which is
+# the conservative choice and the one that keeps rollout/raw_reward comparable
+# to a TRAIN_MTP=0 baseline. Nobody has run that comparison.
+if [ "${MTP_NUM_LAYERS:-0}" != "0" ] && [ "${TRAIN_MTP}" = "1" ]; then
+   MTP_ARGS=(
+      --enable-mtp-training
+      --mtp-loss-scaling-factor ${MTP_LOSS_SCALING_FACTOR}
+   )
+   if [ "${MTP_USE_REPEATED_LAYER}" = "1" ]; then
+      MTP_ARGS+=(--mtp-use-repeated-layer)
+   fi
+   if [ "${MTP_DETACH_HEADS}" = "1" ]; then
+      MTP_ARGS+=(--mtp-detach-heads)
+   fi
+   BACKEND_ARGS+=("${MTP_ARGS[@]}")
+fi
 
 SLIME_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
 source "${SLIME_DIR}/scripts/models/nemotron3.5-super-vl.sh"
