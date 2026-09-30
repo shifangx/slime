@@ -168,15 +168,27 @@ def named_params_and_buffers(args: Namespace, model: Sequence[torch.nn.Module]) 
 
                 # MTP layer indices start from 0
                 layer_idx, rest = match.groups()
-                expert_pattern = r"transformer_layer\.mlp\.experts\.(.+)\.(weight|bias)(\d+)"
+                # Two MTP nestings, because MTP wraps whatever block the model
+                # is made of:
+                #   GPTModel     mtp.layers.{d}.transformer_layer.mlp.experts...
+                #   HybridModel  mtp.layers.{d}.mtp_model_layer.layers.{j}.mlp.experts...
+                # Matching only the first is not a crash -- the `continue`
+                # below yields the name unrebased, so all EP ranks emit expert
+                # indices 0..(num_experts/ep_size - 1) and the last writer wins.
+                # On 32 EP ranks that silently leaves 496 of 512 MTP experts
+                # holding another rank's weights.
+                expert_pattern = (
+                    r"((?:transformer_layer|mtp_model_layer\.layers\.\d+))"
+                    r"\.mlp\.experts\.(.+)\.(weight|bias)(\d+)"
+                )
                 match = re.match(expert_pattern, rest)
                 if not match:
                     yield name, param
                     continue
 
-                rest, param_type, expert_idx = match.groups()
+                infix, rest, param_type, expert_idx = match.groups()
                 expert_idx = int(expert_idx) + expert_offset
-                yield f"{prefix}mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.{param_type}{expert_idx}", param
+                yield f"{prefix}mtp.layers.{layer_idx}.{infix}.mlp.experts.{rest}.{param_type}{expert_idx}", param
                 continue
 
             layer_idx, rest = match.groups()

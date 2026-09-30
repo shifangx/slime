@@ -108,3 +108,17 @@ MODEL_ARGS=(
    # per-run cost here -- SFT sequences are far shorter -- but it sizes RoPE.
    --max-position-embeddings 262144
 )
+
+# ------------------------------------------------------------------- MTP ----
+# The checkpoint carries one Multi-Token-Prediction block -- config.json has
+# num_nextn_predict_layers: 1, and the index has 1,088 mtp.* tensors -- laid
+# out as one attention layer then one MoE layer. The model providers append
+# that "*E" segment to the hybrid pattern when this flag is present.
+#
+# Off unless asked for, because building the block costs ~2.9 B parameters (a
+# full 512-expert MoE layer plus an attention layer) whether or not it trains,
+# and its optimizer state costs that again. MTP_NUM_LAYERS=1 turns it on;
+# --enable-mtp-training (added by the recipe, not here) is what makes it learn.
+if [[ "${MTP_NUM_LAYERS:-0}" != "0" ]]; then
+   MODEL_ARGS+=(--mtp-num-layers "${MTP_NUM_LAYERS}")
+fi

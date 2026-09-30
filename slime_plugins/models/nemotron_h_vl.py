@@ -48,6 +48,9 @@ Usage (see scripts/models/nemotron3.5-super-vl.sh):
 
 from __future__ import annotations
 
+import json
+import os
+
 import torch
 from megatron.core import mpu, tensor_parallel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -343,6 +346,35 @@ class NemotronHVLModel(MegatronModule):
 # types this family's layers_block_type uses.
 _BLOCK_TYPE_SYMBOLS = {"mamba": "M", "moe": "E", "attention": "*"}
 
+# MCore's separator between the main stack and each MTP depth in the unified
+# pattern (hybrid_layer_allocation.Symbols.MTP_SEPARATOR).
+_MTP_SEPARATOR = "/"
+
+# The block layout of one MTP depth for this family: one attention layer then
+# one MoE layer.
+#
+# Unlike the main pattern this is NOT derivable from the config. Nemotron 3's
+# text config carries `mtp_hybrid_override_pattern`, but the 3.5 Omni config
+# carries neither that key nor an MTP entry in `layers_block_type` -- checked
+# against NVIDIA-Nemotron-3.5-Super-EA-09112026/config.json, which has
+# `num_nextn_predict_layers: 1` and nothing else about the MTP block's shape.
+#
+# So it is a literal, and the thing that keeps a literal honest is checking it:
+# validate_mtp_pattern() below reads the checkpoint's own tensor names and
+# refuses a pattern that does not match them. The same "*E" is hard-required by
+# Megatron-Bridge's bridge for this checkpoint
+# (megatron/bridge/models/nemotron_omni/nemotron_omni_bridge.py:401).
+_MTP_BLOCK_PATTERN = "*E"
+
+
+def get_mtp_num_layers(args) -> int:
+    """MTP prediction depths, 0 when MTP is off.
+
+    ``--mtp-num-layers`` is a reset_arg on Megatron's own (slime
+    ``utils/arguments.py:1514``), so it defaults to None rather than 0.
+    """
+    return int(getattr(args, "mtp_num_layers", None) or 0)
+
 
 def get_hybrid_override_pattern(args, hf_config) -> str:
     """The M/E/* string MCore needs, from --hybrid-override-pattern or the config.
@@ -352,6 +384,17 @@ def get_hybrid_override_pattern(args, hf_config) -> str:
     ``layers_block_type`` list instead. Both derive to the same 88-character
     pattern for the Super models, so accept either rather than making the model
     config carry a literal that can drift from the checkpoint.
+
+    With ``--mtp-num-layers`` set the return value is MCore's *unified* pattern:
+    the main stack, then one ``/``-separated segment per prediction depth
+    (``"<88 chars>/*E"`` for one depth). ``HybridModel`` copies the value into
+    ``hybrid_layer_pattern`` and splits it on the separator
+    (``hybrid_model.py:162-170``, ``hybrid_layer_allocation.py:213``), and both
+    Nemotron converters already index main-stack layers through
+    ``pattern.split("/")[0]``, so the composite is what every consumer wants.
+
+    The ``--num-layers`` check applies to the main segment only: the MTP layers
+    are extra and are not counted by ``--num-layers``.
     """
     pattern = getattr(args, "hybrid_override_pattern", None)
     if not pattern:
@@ -371,12 +414,98 @@ def get_hybrid_override_pattern(args, hf_config) -> str:
             "checkpoint whose config carries hybrid_override_pattern or layers_block_type."
         )
 
-    if len(pattern) != args.num_layers:
+    # Before appending: --num-layers counts the main stack, not the MTP depths.
+    main_pattern = pattern.split(_MTP_SEPARATOR)[0]
+    if len(main_pattern) != args.num_layers:
         raise ValueError(
-            f"hybrid layer pattern is {len(pattern)} characters but --num-layers is "
+            f"hybrid layer pattern is {len(main_pattern)} characters but --num-layers is "
             f"{args.num_layers}; every layer needs a symbol."
         )
+
+    mtp_num_layers = get_mtp_num_layers(args)
+    if not mtp_num_layers:
+        return main_pattern
+
+    # An explicit pattern may already carry its own MTP segments; respect it.
+    if _MTP_SEPARATOR in pattern:
+        return pattern
+
+    llm_config = getattr(hf_config, "llm_config", hf_config)
+    mtp_pattern = getattr(args, "mtp_hybrid_override_pattern", None) or getattr(
+        llm_config, "mtp_hybrid_override_pattern", None
+    )
+    if not mtp_pattern:
+        mtp_pattern = _MTP_BLOCK_PATTERN
+    pattern = main_pattern + (_MTP_SEPARATOR + mtp_pattern) * mtp_num_layers
+
+    # Write it back, because this function is not the only reader. The
+    # Megatron->HF converter takes its pattern from args
+    # (megatron_to_hf/nemotron_h.py), and it is what tells the weight sync
+    # which MTP block is which. Leaving the composite only in this function's
+    # return value gives the converter the bare main pattern and a
+    # "hybrid_override_pattern carries no MTP segment" failure on the first
+    # sync -- job 19535251 died of exactly that, one level up, in the loading
+    # direction. Idempotent: the separator check above short-circuits on the
+    # second call.
+    args.hybrid_override_pattern = pattern
     return pattern
+
+
+# Which HF tensor suffixes identify each block symbol inside an MTP layer. Read
+# off NVIDIA-Nemotron-3.5-Super-EA-09112026's index: an attention layer carries
+# mixer.{q,k,v,o}_proj, an MoE layer carries mixer.gate and mixer.experts.
+_MTP_SYMBOL_EVIDENCE = {
+    "*": "mixer.q_proj.weight",
+    "E": "mixer.gate.weight",
+    "M": "mixer.A_log",
+}
+
+
+def validate_mtp_pattern(args, hf_checkpoint: str, pattern: str) -> None:
+    """Check the MTP segments of ``pattern`` against the checkpoint's tensor names.
+
+    ``_MTP_BLOCK_PATTERN`` is a literal because the 3.5 Omni config does not
+    carry the MTP block layout (see its comment). A wrong literal would not
+    fail here -- it would build the wrong layer types, load nothing into them
+    because no HF name matches, and surface much later as a draft head that is
+    silently untrained. The checkpoint index is the cheap ground truth: it
+    needs no GPU and no weights, only ``model.safetensors.index.json``.
+
+    Skipped without complaint when the index is absent (a Megatron-format
+    ``--load`` resume has no HF index, and by then the pattern came from the
+    checkpoint's own args anyway).
+    """
+    if _MTP_SEPARATOR not in pattern:
+        return
+    index_path = os.path.join(hf_checkpoint, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return
+    with open(index_path) as handle:
+        names = json.load(handle).get("weight_map", {})
+
+    # HF flattens every depth into one list, so depth d's j-th block is at
+    # d*L+j -- EXCEPT under --mtp-use-repeated-layer, where MCore builds one
+    # layer object and calls it once per depth
+    # (multi_token_prediction.py:2314-2320, :2414). Every depth then reads the
+    # same serialized block, HF serializes only that one, and there is exactly
+    # one depth's worth of tensors to check.
+    segments = pattern.split(_MTP_SEPARATOR)[1:]
+    if getattr(args, "mtp_use_repeated_layer", False):
+        segments = segments[:1]
+    for depth, segment in enumerate(segments):
+        stride = len(segment)
+        for j, symbol in enumerate(segment):
+            evidence = _MTP_SYMBOL_EVIDENCE.get(symbol)
+            if evidence is None:
+                raise ValueError(f"unknown MTP block symbol {symbol!r} in pattern {pattern!r}")
+            expected = f"mtp.layers.{depth * stride + j}.{evidence}"
+            if not any(name == expected or name.endswith("." + expected) for name in names):
+                raise ValueError(
+                    f"MTP pattern {segment!r} says depth {depth} block {j} is {symbol!r}, but "
+                    f"{hf_checkpoint} has no tensor {expected!r}. The checkpoint's MTP block "
+                    f"layout differs from this model plugin's; fix _MTP_BLOCK_PATTERN or pass "
+                    f"--mtp-hybrid-override-pattern."
+                )
 
 
 def get_nemotron_h_vl_model_provider(args, config, vp_stage=None):
@@ -389,8 +518,10 @@ def get_nemotron_h_vl_model_provider(args, config, vp_stage=None):
             "(expected both vision_config and llm_config)"
         )
     # Fail here rather than inside the first model_provider call, which on a
-    # pipeline-parallel run happens once per stage.
-    get_hybrid_override_pattern(args, hf_config)
+    # pipeline-parallel run happens once per stage. With MTP on, this is also
+    # the cheapest place the literal MTP block layout gets checked against the
+    # checkpoint -- before the 235 GB load, not after it.
+    validate_mtp_pattern(args, args.hf_checkpoint, get_hybrid_override_pattern(args, hf_config))
 
     def model_provider(
         pre_process: bool = True,

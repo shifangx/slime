@@ -38,6 +38,16 @@ from __future__ import annotations
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 
+# MCore's separator between the main stack and each MTP depth in the unified
+# pattern (hybrid_layer_allocation.Symbols.MTP_SEPARATOR).
+_MTP_SEPARATOR = "/"
+
+# One MTP depth for this family: an attention layer then an MoE layer. Nemotron
+# 3's text config carries this as `mtp_hybrid_override_pattern`, but the 3.5
+# Omni config does not carry it at all, so it is a literal in both providers and
+# is checked against the checkpoint by nemotron_h_vl.validate_mtp_pattern().
+_MTP_BLOCK_PATTERN = "*E"
+
 
 def get_nemotron_h_model_provider(args, config, vp_stage=None):
     """Return a model provider that builds MCore's HybridModel for Nemotron-H.
@@ -58,12 +68,28 @@ def get_nemotron_h_model_provider(args, config, vp_stage=None):
             "nemotron3-super-120b-a12b.sh passes it."
         )
 
-    expected = len(hybrid_override_pattern)
+    # --num-layers counts the main stack only. With --mtp-num-layers set, the
+    # pattern MCore wants is the unified one -- main, then one "/"-separated
+    # segment per prediction depth -- and those extra layers are not counted by
+    # --num-layers. So check the main segment, then append.
+    main_pattern = hybrid_override_pattern.split(_MTP_SEPARATOR)[0]
+    expected = len(main_pattern)
     if expected != args.num_layers:
         raise ValueError(
             f"--hybrid-override-pattern is {expected} characters but --num-layers "
             f"is {args.num_layers}; every layer needs a symbol."
         )
+
+    mtp_num_layers = int(getattr(args, "mtp_num_layers", None) or 0)
+    if mtp_num_layers and _MTP_SEPARATOR not in hybrid_override_pattern:
+        mtp_pattern = getattr(args, "mtp_hybrid_override_pattern", None) or _MTP_BLOCK_PATTERN
+        hybrid_override_pattern = main_pattern + (_MTP_SEPARATOR + mtp_pattern) * mtp_num_layers
+        # Write it back: the Megatron->HF converter reads the pattern off args,
+        # not off this function, and needs the MTP segment to name the synced
+        # MTP tensors. See nemotron_h_vl.get_hybrid_override_pattern().
+        args.hybrid_override_pattern = hybrid_override_pattern
+    elif not mtp_num_layers:
+        hybrid_override_pattern = main_pattern
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None):
         return HybridModel(

@@ -142,6 +142,10 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
     if name in direct:
         return reader.get_tensor(direct[name])
 
+    mtp_match = re.fullmatch(r"mtp\.layers\.(\d+)\.(.+)", name)
+    if mtp_match:
+        return _convert_mtp(reader, name, hf_config, int(mtp_match.group(1)), mtp_match.group(2))
+
     layer_match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
     if not layer_match:
         raise KeyError(f"Unsupported Nemotron-H Megatron parameter {name!r}")
@@ -156,7 +160,72 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
         raise KeyError(f"Layer {layer_idx} is past the end of hybrid_override_pattern ({len(pattern)} layers)")
     symbol = pattern[layer_idx]
 
-    hf = f"backbone.layers.{layer_idx}"
+    return _convert_block(reader, name, hf_config, symbol, rest, f"backbone.layers.{layer_idx}")
+
+
+def _mtp_patterns(hf_config) -> list[str]:
+    """The ``/``-separated MTP segments of the unified hybrid pattern, one per depth."""
+    segments = str(hf_config.hybrid_override_pattern).split("/")[1:]
+    if not segments:
+        raise KeyError(
+            "an mtp.* parameter was requested but hybrid_override_pattern carries no MTP "
+            "segment; pass --mtp-num-layers so the provider appends one"
+        )
+    return segments
+
+
+def _convert_mtp(reader, name: str, hf_config, depth: int, rest: str):
+    """Map one ``mtp.layers.{depth}.…`` MCore name onto its HF tensor.
+
+    MCore nests an MTP depth as a wrapper (``enorm`` / ``hnorm`` / ``eh_proj``)
+    around an inner stack, ``mtp.layers.{d}.mtp_model_layer.layers.{j}.…``.
+    HF flattens both into one list, so depth ``d``'s ``j``-th block lands at
+    ``d*L + j`` where ``L`` is the length of that depth's pattern segment --
+    the same arithmetic SGLang does at ``nemotron_h_mtp.py:253-270``. Verified
+    against NVIDIA-Nemotron-3.5-Super-EA-09112026's index, where the single
+    depth of ``*E`` gives ``mtp.layers.0`` the attention tensors and
+    ``mtp.layers.1`` the MoE ones, with ``final_layernorm`` on the last block.
+
+    The per-symbol bodies are the main stack's, unchanged: ``_convert_block``
+    is shared with the decoder branch rather than copied, because two copies
+    would be free to drift and this model family punishes exactly that.
+    """
+    segments = _mtp_patterns(hf_config)
+    if depth >= len(segments):
+        raise KeyError(f"MTP depth {depth} is past the end of the pattern ({len(segments)} depths)")
+    segment = segments[depth]
+    stride = len(segment)
+    base = depth * stride
+
+    # Wrapper tensors: HF puts them on the depth's first block, and the trailing
+    # final_layernorm on its last.
+    if rest in {"enorm.weight", "hnorm.weight", "eh_proj.weight"}:
+        return reader.get_tensor(f"mtp.layers.{base}.{rest}")
+    if rest == "final_layernorm.weight":
+        return reader.get_tensor(f"mtp.layers.{base + stride - 1}.final_layernorm.weight")
+
+    inner = re.fullmatch(r"mtp_model_layer\.layers\.(\d+)\.(.+)", rest)
+    if not inner:
+        raise KeyError(f"Unsupported Nemotron-H MTP parameter {name!r}")
+    j, inner_rest = int(inner.group(1)), inner.group(2)
+    if j >= stride:
+        raise KeyError(f"MTP block {j} is past the end of depth {depth}'s pattern {segment!r}")
+
+    return _convert_block(reader, name, hf_config, segment[j], inner_rest, f"mtp.layers.{base + j}")
+
+
+def _convert_block(reader, name: str, hf_config, symbol: str, rest: str, hf: str):
+    """The per-symbol HF->MCore mapping for one hybrid block.
+
+    Shared verbatim by the main decoder stack and by the inner layers of every
+    MTP depth: an MTP block of symbol ``s`` is the same kind of layer as a main
+    stack block of symbol ``s``, and its HF tensors are spelled the same way
+    under a different prefix.
+
+    Args:
+        hf: the HF prefix for this block -- ``backbone.layers.{i}`` for the main
+            stack, ``mtp.layers.{d*L+j}`` for an MTP block.
+    """
     # Every layer type has the same pre-mixer norm on the HF side; MCore reaches
     # it under three different names depending on what the layer is.
     pre_norm_names = {
@@ -229,4 +298,4 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
             return reader.get_tensor(f"{hf}.mixer.shared_experts.{shared[rest]}.weight")
         raise KeyError(f"Unsupported Nemotron-H MoE parameter {name!r}")
 
-    raise KeyError(f"Layer {layer_idx} has unknown hybrid symbol {symbol!r} for parameter {name!r}")
+    raise KeyError(f"{hf} has unknown hybrid symbol {symbol!r} for parameter {name!r}")

@@ -1,5 +1,6 @@
 import dataclasses
 import gc
+import inspect
 import logging
 import math
 import os
@@ -344,6 +345,135 @@ def disable_forward_pre_hook(model_chunks: Sequence[DDP], param_sync: bool = Tru
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
+# Attributes that hold a wrapped model: DDP and Float16Module use `.module`,
+# the multimodal wrappers hold their decoder as `.language_model`.
+_MODEL_WRAPPER_ATTRS = ("module", "language_model")
+
+
+def _mtp_forward_parameters(model):
+    """Signature of the ``forward`` that actually owns the MTP switch, or ``{}``.
+
+    A breadth-first walk of the wrapper chain, returning the first ``forward``
+    that *explicitly* names ``compute_mtp_loss`` or ``mtp_kwargs``.
+
+    "Explicitly" is the load-bearing word. ``NemotronHVLModel.forward`` takes
+    ``**kwargs`` and forwards them to its ``HybridModel``
+    (``nemotron_h_vl.py:295-312``), as do DDP and Float16Module -- so every
+    wrapper in the chain would *accept* either keyword while only the innermost
+    model knows what to do with it. Treating ``**kwargs`` as ownership picks the
+    wrong answer; requiring the explicit name walks past the wrappers to the
+    model. Job 19536597 died in ``train_one_step`` because the walk stopped at
+    the wrapper instead.
+
+    Passing the keyword at the top of the chain is still correct: every wrapper
+    between here and the owner forwards it on.
+    """
+    seen: set[int] = set()
+    queue = [model]
+    while queue:
+        module = queue.pop(0)
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+
+        forward = getattr(module, "forward", None)
+        if forward is not None:
+            try:
+                parameters = inspect.signature(forward).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "compute_mtp_loss" in parameters or "mtp_kwargs" in parameters:
+                return parameters
+
+        for attr in _MODEL_WRAPPER_ATTRS:
+            inner = getattr(module, attr, None)
+            if inner is not None and inner is not module:
+                queue.append(inner)
+    return {}
+
+
+def _ensure_mtp_position_ids(args, forward_kwargs: dict, tokens) -> None:
+    """Give the hybrid MTP block the ``position_ids`` it asserts on.
+
+    slime calls with ``position_ids=None`` -- correct for the main stack, which
+    for this model family has ``--position-embedding-type none`` and reads no
+    positions at all. The MTP block re-embeds its shifted tokens through the
+    same embedding and MCore asserts both are present regardless
+    (``hybrid_model.py:606``), which is what killed job 19537535 on its first
+    training step.
+
+    Synthesising them is only safe **because** the values are then unused. Under
+    any real position embedding a plain ``arange`` would be wrong -- with packed
+    sequences positions restart per sequence, so an arange spanning the whole
+    packed batch would feed the wrong rotary phase to every sequence but the
+    first, silently. So that case raises instead.
+    """
+    if forward_kwargs.get("position_ids") is not None:
+        return
+
+    position_embedding_type = getattr(args, "position_embedding_type", None)
+    if position_embedding_type != "none":
+        raise ValueError(
+            "MTP training needs position_ids, and this run's "
+            f"--position-embedding-type is {position_embedding_type!r}, so they cannot be "
+            "synthesised here: with packed sequences the positions restart per sequence and a "
+            "flat arange would feed the wrong phase to every sequence but the first. Pass real "
+            "position_ids from the batch instead."
+        )
+
+    forward_kwargs["position_ids"] = torch.arange(
+        tokens.shape[-1], dtype=torch.long, device=tokens.device
+    ).expand(tokens.shape)
+
+
+def set_mtp_forward_kwargs(args, model, forward_kwargs: dict, tokens, *, compute_mtp_loss: bool) -> None:
+    """Ask the model to run (or skip) its MTP head, in whichever spelling it takes.
+
+    The two MCore model classes disagree on both the keyword and the default,
+    and the disagreement is not cosmetic:
+
+    ==================  ==========================================  ====================
+    .                   ``GPTModel``                                ``HybridModel``
+    ==================  ==========================================  ====================
+    keyword             ``mtp_kwargs={"mtp_labels": ...}``          ``compute_mtp_loss``
+    MTP runs when       ``labels`` or ``mtp_labels`` is not None    ``compute_mtp_loss``
+                        (``gpt_model.py:730``)                      (``hybrid_model.py:589``)
+    default             off -- slime always passes ``labels=None``  **on**
+    labels for the CE   ``mtp_labels``, else ``input_ids``          always ``input_ids``
+    ==================  ==========================================  ====================
+
+    So on ``GPTModel`` passing ``mtp_labels`` is the opt-in, while on
+    ``HybridModel`` there is no opt-in at all and ``compute_mtp_loss=False`` is
+    the only way to opt *out*. ``HybridModel.forward`` has no ``**kwargs``, so
+    sending ``mtp_kwargs`` to it is a ``TypeError``.
+
+    ``mtp_labels`` is unnecessary on the hybrid path because ``input_ids`` *is*
+    ``batch["tokens"]`` at both call sites -- the same tensor GPTModel would
+    receive as ``mtp_labels``.
+
+    Which spelling to use is a capability question, not a model-name question,
+    so it is answered by inspecting the signature -- the idiom
+    ``update_weight/common.py:145-146`` already uses for
+    ``get_transformer_layer_offset`` -- of the model behind the wrappers rather
+    than of the wrappers themselves. See ``_mtp_forward_parameters``.
+    """
+    parameters = _mtp_forward_parameters(model)
+    if "compute_mtp_loss" in parameters:
+        forward_kwargs["compute_mtp_loss"] = compute_mtp_loss
+        if compute_mtp_loss:
+            _ensure_mtp_position_ids(args, forward_kwargs, tokens)
+    elif "mtp_kwargs" in parameters:
+        if compute_mtp_loss:
+            forward_kwargs["mtp_kwargs"] = {"mtp_labels": tokens}
+    elif compute_mtp_loss:
+        raise TypeError(
+            f"No forward reachable from {type(model).__name__} through "
+            f"{'/'.join(_MODEL_WRAPPER_ATTRS)} names 'compute_mtp_loss' or 'mtp_kwargs', so MTP "
+            "training cannot be requested of it. Drop --enable-mtp-training, or teach this model's "
+            "forward one of the two spellings."
+        )
+
+
 @torch.no_grad()
 def forward_only(
     f: Callable[..., dict[str, list[torch.Tensor]]],
@@ -433,6 +563,14 @@ def forward_only(
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
+        # These are the reference / old-actor log-probability passes. They have
+        # no labels and their output is not trained through, so the MTP head
+        # must not run: on the hybrid path compute_mtp_loss defaults to True,
+        # which would burn two extra layers per micro-batch AND push entries
+        # into MTPLossLoggingHelper.tracker that train_one_step then scales by
+        # 1/num_microbatches, making train/mtp_loss wrong by an integer factor.
+        if getattr(args, "mtp_num_layers", None):
+            set_mtp_forward_kwargs(args, model, forward_kwargs, tokens, compute_mtp_loss=False)
         output_tensor = model(**forward_kwargs)
 
         output_kwargs = {
@@ -634,7 +772,7 @@ def train_one_step(
                 forward_kwargs.update(batch["multimodal_train_inputs"])
 
             if args.enable_mtp_training:
-                forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
+                set_mtp_forward_kwargs(args, model, forward_kwargs, batch["tokens"], compute_mtp_loss=True)
 
             output_tensor = model(**forward_kwargs)
 
@@ -849,26 +987,62 @@ def train(
                 config.param_sync_func = param_sync_func
                 pre_hook_enabled = True
 
+        mtp_losses = None
         if args.enable_mtp_training:
             from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
             mtp_loss_scale = 1 / num_microbatches[step_id]
             tracker = MTPLossLoggingHelper.tracker
-            if "values" in tracker:
-                values = tracker["values"]
-                if tracker.get("reduce_group") is not None:
-                    torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
-                if tracker.get("avg_group") is not None:
-                    torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-                # Multi-head MTP: tracker["values"] is [num_mtp_layers]; aggregate below.
-                mtp_losses = tracker["values"] * mtp_loss_scale
-                MTPLossLoggingHelper.clean_loss_in_tracker()
+            # MCore renamed this API. The tracker key "values" became
+            # "loss_values" (alongside new correct_values / total_values
+            # accuracy counters) and clean_loss_in_tracker() became
+            # clean_metrics_in_tracker(). Against Megatron 9d77d9ef6 the old
+            # spellings mean the key is never found, mtp_losses is never
+            # assigned, and the logging block below raises UnboundLocalError
+            # *after* a full training step -- job 19538150. Prefer the current
+            # names, keep the old ones so an older Megatron still works.
+            loss_key = "loss_values" if "loss_values" in tracker else "values"
+            if loss_key in tracker:
+                # MCore's own reducer when it exists: it handles reduce_group,
+                # avg_group and the accuracy counters together, and it is the
+                # thing that stays right when this API moves again.
+                reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_metrics_in_tracker", None)
+                if reduce_in_tracker is not None:
+                    reduce_in_tracker()
+                else:
+                    values = tracker[loss_key]
+                    if tracker.get("reduce_group") is not None:
+                        torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
+                    if tracker.get("avg_group") is not None:
+                        torch.distributed.all_reduce(
+                            values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG
+                        )
+                # Multi-head MTP: the entry is [num_mtp_layers]; aggregate
+                # below. Multiplying makes a new tensor, so the in-place
+                # zero_() in the cleaner cannot reach back into it.
+                mtp_losses = tracker[loss_key] * mtp_loss_scale
+                clean_tracker = getattr(
+                    MTPLossLoggingHelper,
+                    "clean_metrics_in_tracker",
+                    getattr(MTPLossLoggingHelper, "clean_loss_in_tracker", None),
+                )
+                if clean_tracker is not None:
+                    clean_tracker()
 
                 # CI check: verify MTP loss is within expected bounds
                 if args.ci_test:
                     from slime.backends.megatron_utils.ci_utils import check_mtp_loss
 
                     check_mtp_loss(mtp_losses.sum().item())
+            else:
+                # Nothing recorded this step. Worth a word rather than a silent
+                # gap in the curve: it means the MTP forward did not run, or
+                # ran somewhere this rank cannot see.
+                logger.warning(
+                    "--enable-mtp-training is set but MTPLossLoggingHelper.tracker has no loss "
+                    "entry (keys: %s); train/mtp_*_loss will be missing for this step.",
+                    sorted(tracker),
+                )
 
         # per train step log.
         if (
@@ -884,7 +1058,7 @@ def train(
                 for key, val in loss_dict.items()
             }
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
-            if args.enable_mtp_training:
+            if args.enable_mtp_training and mtp_losses is not None:
                 for _i in range(mtp_losses.shape[0]):
                     log_dict[f"train/{role_tag}mtp_{_i + 1}_loss"] = mtp_losses[_i].item()
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses.sum().item()

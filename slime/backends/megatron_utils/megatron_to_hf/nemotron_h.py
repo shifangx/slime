@@ -99,6 +99,10 @@ def convert_nemotron_h_to_hf(args, name, param):
     if name in direct:
         return [(direct[name], param)]
 
+    mtp_match = re.fullmatch(r"mtp\.layers\.(\d+)\.(.+)", name)
+    if mtp_match:
+        return _convert_mtp(args, name, param, int(mtp_match.group(1)), mtp_match.group(2))
+
     layer_match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
     if not layer_match:
         raise ValueError(f"Unsupported Nemotron-H Megatron parameter {name!r}")
@@ -107,8 +111,58 @@ def convert_nemotron_h_to_hf(args, name, param):
 
     pattern = args.hybrid_override_pattern.split("/")[0]
     symbol = pattern[layer_idx]
-    hf = f"backbone.layers.{layer_idx}"
+    return _convert_block(args, name, param, symbol, rest, f"backbone.layers.{layer_idx}")
 
+
+def _convert_mtp(args, name: str, param, depth: int, rest: str):
+    """Map one ``mtp.layers.{depth}.…`` MCore name onto its HF tensor(s).
+
+    The inverse of ``hf_to_megatron/nemotron_h.py:_convert_mtp`` and the same
+    arithmetic: MCore's wrapper tensors sit on the depth itself, its inner
+    layers under ``mtp_model_layer.layers.{j}``, and HF flattens both into one
+    list at ``d*L + j``.
+
+    Two properties of this direction carry over from the main stack unchanged:
+    the routed experts arrive **per expert** already EP-rebased by
+    ``update_weight/common.py``, so this only renames; and Nemotron's experts
+    are not gated, so ``linear_fc1`` is ``up_proj`` alone.
+    """
+    segments = str(args.hybrid_override_pattern).split("/")[1:]
+    if not segments:
+        raise ValueError(
+            f"{name!r} is an MTP parameter but --hybrid-override-pattern carries no MTP segment"
+        )
+    if depth >= len(segments):
+        raise ValueError(f"MTP depth {depth} is past the end of the pattern ({len(segments)} depths)")
+    segment = segments[depth]
+    stride = len(segment)
+    base = depth * stride
+
+    if rest in {"enorm.weight", "hnorm.weight", "eh_proj.weight"}:
+        return [(f"mtp.layers.{base}.{rest}", param)]
+    if rest == "final_layernorm.weight":
+        return [(f"mtp.layers.{base + stride - 1}.final_layernorm.weight", param)]
+
+    inner = re.fullmatch(r"mtp_model_layer\.layers\.(\d+)\.(.+)", rest)
+    if not inner:
+        raise ValueError(f"Unsupported Nemotron-H MTP parameter {name!r}")
+    j, inner_rest = int(inner.group(1)), inner.group(2)
+    if j >= stride:
+        raise ValueError(f"MTP block {j} is past the end of depth {depth}'s pattern {segment!r}")
+
+    return _convert_block(args, name, param, segment[j], inner_rest, f"mtp.layers.{base + j}")
+
+
+def _convert_block(args, name: str, param, symbol: str, rest: str, hf: str):
+    """The per-symbol MCore->HF mapping for one hybrid block.
+
+    Shared by the main decoder stack and by every MTP depth's inner layers --
+    lifted rather than copied, so the two can never drift apart.
+
+    Args:
+        hf: the HF prefix -- ``backbone.layers.{i}`` for the main stack,
+            ``mtp.layers.{d*L+j}`` for an MTP block.
+    """
     # The pre-mixer norm, whichever linear MCore folded it into.
     if rest in {
         "mixer.in_proj.layer_norm_weight",
@@ -171,4 +225,4 @@ def convert_nemotron_h_to_hf(args, name, param):
             return [(f"{hf}.mixer.shared_experts.{shared[rest]}.weight", param)]
         raise ValueError(f"Unsupported Nemotron-H MoE parameter {name!r}")
 
-    raise ValueError(f"Layer {layer_idx} has unknown hybrid symbol {symbol!r} for parameter {name!r}")
+    raise ValueError(f"{hf} has unknown hybrid symbol {symbol!r} for parameter {name!r}")

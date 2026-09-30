@@ -39,7 +39,6 @@ sharded, so their tensors pass through whole.
 
 from __future__ import annotations
 
-import copy
 import re
 
 import torch
@@ -134,6 +133,30 @@ def _vision_tensor(rest: str, reader: SafetensorReader, hf_config) -> torch.Tens
     return reader.get_tensor(f"vision_model.{rest}")
 
 
+def _mtp_suffix(llm_config) -> str:
+    """The ``/``-separated MTP segments for this checkpoint, or ``""``.
+
+    Derived from the checkpoint, not from ``args``: this module is reached
+    through ``get_hf_tensor(name, reader, config)``, which carries no args.
+    ``num_nextn_predict_layers`` is the number of prediction depths, and each
+    depth's block layout is one attention layer then one MoE layer.
+
+    That ``"*E"`` is a literal because no key in the 3.5 omni config states it
+    -- ``mtp_hybrid_override_pattern`` is absent, and ``layers_block_type``
+    covers the main stack only. What keeps the literal honest is that the model
+    provider's ``validate_mtp_pattern()`` checks the same value against the
+    checkpoint's own ``mtp.*`` tensor names before any of this runs, and
+    Megatron-Bridge hard-requires the same ``"*E"`` for this checkpoint
+    (``nemotron_omni_bridge.py:401``).
+
+    Emitting it unconditionally is safe for a non-MTP run: MCore asks for no
+    ``mtp.*`` names, and the decoder branch already indexes through
+    ``pattern.split("/")[0]``.
+    """
+    depths = int(getattr(llm_config, "num_nextn_predict_layers", 0) or 0)
+    return "/*E" * depths
+
+
 def _language_config(hf_config):
     """The decoder's config, with the hybrid pattern the text converter expects.
 
@@ -141,27 +164,57 @@ def _language_config(hf_config):
     what each layer index is. Nemotron 3's config spells that out; the 3.5 omni
     config nests the language model and spells it as ``layers_block_type``
     instead, so derive it rather than requiring the caller to pass a literal.
+
+    The MTP segments are appended here too, because the same string is what
+    ``_convert_mtp`` uses to know each MTP block's type and its ``d*L+j`` HF
+    index.
     """
     llm_config = getattr(hf_config, "llm_config", hf_config)
-    if getattr(llm_config, "hybrid_override_pattern", None):
+    existing = getattr(llm_config, "hybrid_override_pattern", None)
+    if existing:
+        if "/" in existing:
+            return llm_config
+        pattern = existing
+    else:
+        block_types = getattr(llm_config, "layers_block_type", None)
+        if not block_types:
+            raise KeyError(
+                "Nemotron omni llm_config has neither hybrid_override_pattern nor layers_block_type"
+            )
+        try:
+            pattern = "".join(_BLOCK_TYPE_SYMBOLS[block] for block in block_types)
+        except KeyError as exc:
+            raise KeyError(f"unknown layers_block_type entry {exc.args[0]!r}") from exc
+
+    suffix = _mtp_suffix(llm_config)
+    if not suffix and existing:
         return llm_config
-
-    block_types = getattr(llm_config, "layers_block_type", None)
-    if not block_types:
-        raise KeyError(
-            "Nemotron omni llm_config has neither hybrid_override_pattern nor layers_block_type"
-        )
-    try:
-        pattern = "".join(_BLOCK_TYPE_SYMBOLS[block] for block in block_types)
-    except KeyError as exc:
-        raise KeyError(f"unknown layers_block_type entry {exc.args[0]!r}") from exc
-
     # Do not mutate the caller's config object: it is shared with the model
     # provider, which derives the same pattern for MCore and would then disagree
     # about where it came from.
-    llm_config = copy.copy(llm_config)
-    llm_config.hybrid_override_pattern = pattern
-    return llm_config
+    return _PatternOverride(llm_config, pattern + suffix)
+
+
+class _PatternOverride:
+    """A read-through view of a config with ``hybrid_override_pattern`` replaced.
+
+    Not ``copy.copy`` plus an assignment: ``NemotronHConfig`` exposes
+    ``hybrid_override_pattern`` as a read-only ``property`` derived from
+    ``layers_block_type``, the property lives on the class, and a shallow copy
+    keeps it -- so assigning raises ``AttributeError: property ... has no
+    setter``. Job 19535775 died of exactly that.
+
+    ``__getattr__`` runs only when normal lookup fails, so the instance
+    attribute set here wins and everything else falls through to the real
+    config.
+    """
+
+    def __init__(self, config, pattern: str):
+        self._config = config
+        self.hybrid_override_pattern = pattern
+
+    def __getattr__(self, name):
+        return getattr(self._config, name)
 
 
 class _PrefixedReader:
