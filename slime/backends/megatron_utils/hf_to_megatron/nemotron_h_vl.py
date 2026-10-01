@@ -11,7 +11,19 @@ prefix the omni checkpoint puts in front of it and the handful of vision keys:
     vision_projector.mlp1.norm.weight          mlp1.0.weight
     vision_projector.mlp1.linear1.weight       mlp1.1.weight
     vision_projector.mlp1.linear2.weight       mlp1.3.weight
-    vision_projector.vision_final_layernorm.*  vision_projector.vision_final_layernorm.*
+
+Two parameter families the checkpoint and the reference class *do* have are
+absent from that table, because ``_align_vision_modules_with_vllm``
+(``slime_plugins/models/nemotron_h_vl.py``) removes them from the model before
+this converter ever sees it: ``vision_projector.vision_final_layernorm.*`` (set
+to ``None``) and ``encoder.layer.{i}.layer_scale{1,2}.lambda1`` (replaced with
+``nn.Identity``). The rollout engine is pinned to vLLM's semantics and has
+neither, so the actor must not have them either. This converter is driven by the
+Megatron model's ``named_parameters()``, so a removed module simply never asks:
+the checkpoint's two ``vision_final_layernorm`` tensors are left unread, and the
+LayerScale names -- which the checkpoint never carried anyway -- are never
+synthesised. Either name arriving here now is a bug in the stripping, not
+something to serve, so both fall through to the ``KeyError`` below.
 
 The three ``mlp1`` renames are not invented here: they are the checkpoint's own
 conversion mapping, registered by ``register_nemotron_h_omni_conversion_mapping``
@@ -91,19 +103,18 @@ def _vision_config(hf_config):
 def _vision_tensor(rest: str, reader: SafetensorReader, hf_config) -> torch.Tensor:
     """Resolve one RadioModel parameter name against the C-RADIO checkpoint."""
 
-    # LayerScale is the one parameter with no checkpoint counterpart at all.
-    # C-RADIO ViT-H has no layerscale, but RadioLayer builds one unconditionally
-    # (modeling_radio.py:372,381) as `layerscale_value * ones(hidden_size)`, and
-    # layerscale_value is 1.0 here -- so `hidden_state * lambda1` is the
-    # identity and the reference model loads with these as missing keys left at
-    # their init value. Synthesising that value is what keeps the two models
-    # numerically equal; raising here, or loading zeros, would not.
+    # LayerScale used to be synthesised here: C-RADIO ViT-H has no layerscale,
+    # but RadioLayer builds one unconditionally (modeling_radio.py:372,381) as
+    # `layerscale_value * ones(hidden_size)`, and the checkpoint carries no
+    # tensor for it. _align_vision_modules_with_vllm now replaces those modules
+    # with nn.Identity before the model reaches this converter, matching vLLM
+    # (radio.py:733-734 skips ls1/ls2 on load), so there is no parameter left to
+    # resolve. A lambda1 name arriving here means the stripping did not run --
+    # say so rather than quietly manufacturing a gate the engine does not have.
     if re.fullmatch(r"encoder\.layer\.\d+\.layer_scale[12]\.lambda1", rest):
-        vision_config = _vision_config(hf_config)
-        return torch.full(
-            (vision_config.hidden_size,),
-            float(vision_config.layerscale_value),
-            dtype=torch.float32,
+        raise KeyError(
+            f"Nemotron 3.5 VL vision parameter {rest!r} should have been removed by "
+            "_align_vision_modules_with_vllm; the actor and the rollout engine would disagree"
         )
 
     for source, target in _VISION_RENAMES:
@@ -245,8 +256,16 @@ def nemotron_h_vl_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> t
 
     if name.startswith("vision_projector."):
         rest = name[len("vision_projector.") :]
+        # The checkpoint has vision_final_layernorm.{weight,bias} and this used
+        # to pass them through. vLLM's engine has no such module, the rollout is
+        # pinned to vLLM, and _align_vision_modules_with_vllm therefore sets the
+        # attribute to None on the actor too -- so the parameter no longer
+        # exists and this name cannot legitimately be requested.
         if rest.startswith("vision_final_layernorm."):
-            return reader.get_tensor(name)
+            raise KeyError(
+                f"Nemotron 3.5 VL projector parameter {name!r} should have been removed by "
+                "_align_vision_modules_with_vllm; the actor and the rollout engine would disagree"
+            )
         mlp1_match = re.fullmatch(r"(mlp1\.(?:norm|linear1|linear2))\.(weight|bias)", rest)
         if mlp1_match:
             module, suffix = mlp1_match.groups()

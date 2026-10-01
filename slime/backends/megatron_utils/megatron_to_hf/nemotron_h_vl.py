@@ -12,7 +12,6 @@ plus the vision keys.
     vision_projector.mlp1.norm.weight           mlp1.0.weight
     vision_projector.mlp1.linear1.weight        mlp1.1.weight
     vision_projector.mlp1.linear2.weight        mlp1.3.weight
-    vision_projector.vision_final_layernorm.*   vision_projector.vision_final_layernorm.*
 
 Why the released checkpoint's key set is the target
 ---------------------------------------------------
@@ -23,7 +22,6 @@ its ``load_weights`` routes purely by prefix:
     language_model.*                  -> the LLM, prefix stripped
     mlp1.*                            -> the projector nn.Sequential, by index
     vision_model.radio_model.*        -> the RADIO tower, `vision_model.` stripped
-    vision_projector.vision_final_layernorm.*  -> the Super-only LayerNorm
 
 which is exactly the naming of the released checkpoint, because cold start loads
 that checkpoint through this very method. So "emit the checkpoint's own keys" is
@@ -38,8 +36,8 @@ not raise. It produces an engine running partly stale weights and a quietly
 wrong ``train_rollout_logprob_abs_diff``, which is why every line below is
 pinned to a checkpoint key or to a named sglang parameter.
 
-Two places where this is more than a rename
--------------------------------------------
+One place where this is more than a rename
+------------------------------------------
   * **Fused qkv.** RadioModel spells attention as three Linears
     (``attention.attention.{query,key,value}``); the checkpoint and sglang both
     want one ``attn.qkv``. The load direction splits it with ``Chunk(dim=0)``
@@ -50,16 +48,18 @@ Two places where this is more than a rename
     with no shard id (models/radio.py:598), i.e. it only accepts the fused form;
     emitting q/k/v separately would hit the silent-drop path above.
 
-  * **LayerScale.** ``encoder.layer.{i}.layer_scale{1,2}.lambda1`` has no
-    checkpoint counterpart at all -- C-RADIO ViT-H ships no layerscale, and the
-    load direction synthesises it as ``layerscale_value * ones`` precisely
-    because it is absent. But it *is* an nn.Parameter on both sides (this tower
-    is not frozen in the GRPO recipe, so it trains), and sglang's layer does
-    carry one, as ``ls1``/``ls2`` (models/internvl.py:249-250). So these map to
-    ``...blocks.{i}.ls{1,2}``, which is the one target below that is a named
-    sglang parameter rather than a checkpoint key. Dropping them instead would
-    leave the engine on the init value and diverge from the trainer as soon as
-    the first optimizer step moved them.
+Two vision parameter families are no longer emitted at all
+----------------------------------------------------------
+``encoder.layer.{i}.layer_scale{1,2}.lambda1`` and
+``vision_projector.vision_final_layernorm.*`` used to be mapped here -- the first
+onto sglang's ``ls{1,2}``, the second passed through under its own name. Both are
+gone, in both directions, because the rollout engine is now pinned to vLLM's
+vision semantics (``radio.py:733-734`` skips ls1/ls2; vLLM has no projector
+LayerNorm at all) and ``_align_vision_modules_with_vllm``
+(``slime_plugins/models/nemotron_h_vl.py``) removes the matching modules from the
+actor. Neither name is in ``named_parameters()`` any more, so neither reaches
+this converter; if one does, the stripping did not run and the two sides are
+about to disagree -- so both raise instead of being mapped or dropped.
 
 Buffers -- ``input_conditioner.norm_{mean,std}`` and ``summary_idxs`` -- are not
 parameters, and the weight sync only walks ``named_parameters()`` plus
@@ -138,11 +138,15 @@ def _convert_vision(rest: str, param: torch.Tensor):
             component, suffix = qkv_match.groups()
             return _fuse_qkv(block_idx, component, suffix, param)
 
-        # LayerScale: no checkpoint key, but sglang's layer has ls1/ls2. See the
-        # module docstring for why this is mapped rather than dropped.
-        layer_scale_match = re.fullmatch(r"layer_scale([12])\.lambda1", inner)
-        if layer_scale_match:
-            return [(f"vision_model.radio_model.model.blocks.{block_idx}.ls{layer_scale_match.group(1)}", param)]
+        # LayerScale: removed from the actor to match vLLM, so it must not be in
+        # named_parameters(). Mapping it onto sglang's ls1/ls2 would write a gate
+        # the engine is built to ignore; dropping it silently would hide the fact
+        # that the stripping failed. See the module docstring.
+        if re.fullmatch(r"layer_scale[12]\.lambda1", inner):
+            raise ValueError(
+                f"Nemotron 3.5 VL vision parameter {rest!r} should have been removed by "
+                "_align_vision_modules_with_vllm; the actor and the rollout engine would disagree"
+            )
 
         for source, target in _VISION_BLOCK_RENAMES:
             if inner == source or inner.startswith(f"{source}."):
@@ -155,10 +159,14 @@ def _convert_vision(rest: str, param: torch.Tensor):
 
 def _convert_projector(rest: str, name: str, param: torch.Tensor):
     """Map one vision-projector parameter name onto the checkpoint's."""
-    # The Super-only LayerNorm keeps its name: NemotronH_Omni_Reasoning_V3 loads
-    # it by the `vision_projector.vision_final_layernorm.` prefix verbatim.
+    # The Super-only LayerNorm used to be emitted under its own name. The engine
+    # no longer has the module (vLLM parity) and neither does the actor, so this
+    # name reaching here means the stripping did not run.
     if rest.startswith("vision_final_layernorm."):
-        return [(f"vision_projector.{rest}", param)]
+        raise ValueError(
+            f"Nemotron 3.5 VL projector parameter {name!r} should have been removed by "
+            "_align_vision_modules_with_vllm; the actor and the rollout engine would disagree"
+        )
 
     mlp1_match = re.fullmatch(r"(mlp1\.(?:norm|linear1|linear2))\.(weight|bias)", rest)
     if mlp1_match:

@@ -22,12 +22,19 @@ rather than reimplemented:
     modeling_nemotron_h_omni.NemotronH_Omni_Reasoning_V3VisionProjector
 
 That is the same idiom ``qwen3_5_vl.py`` uses for its Transformers ViT, and it
-is deliberate: the projector owns a LayerNorm whose presence is keyed on the
-language model having MTP layers, a pixel-shuffle whose version flag matters,
-and an ``mlp1`` whose activation is squared-ReLU. Reimplementing any of that
-here would be transcribing semantics that the checkpoint already ships. The
-weight names then match the checkpoint too, which is what lets
+is deliberate: the projector owns a pixel-shuffle whose version flag matters and
+an ``mlp1`` whose activation is squared-ReLU. Reimplementing any of that here
+would be transcribing semantics that the checkpoint already ships. The weight
+names then match the checkpoint too, which is what lets
 ``hf_to_megatron/nemotron_h_vl.py`` stay a thin dispatcher.
+
+Two of those reference modules are then removed again, by
+``_align_vision_modules_with_vllm``: the projector's ``vision_final_layernorm``
+and the tower's 64 ``RadioLayerScale`` gates. Both are parameters vLLM's
+implementation does not have, and the rollout engine is pinned to vLLM's
+semantics, so the actor has to drop them too or it would score rollouts with a
+vision tower the engine never ran. See that function and
+``Scripts-Slime/grpo_vlm_geo3k_nemotron3.5/docs/08_vllm_parity_vision_path.md``.
 
 Unlike Qwen3.5-VL this model does *not* use mrope, and it does not use rope
 either: the 8 attention layers in the hybrid stack are NoPE. SGLang's
@@ -64,6 +71,58 @@ from slime.utils.accelerator import current_device
 from .qwen3_5_vl_utils import gather_packed_input_ids, get_packed_cp_local_indices
 
 
+def _align_vision_modules_with_vllm(vision_model, vision_projector) -> None:
+    """Strip the two vision parameters vLLM's implementation does not have.
+
+    The GRPO rollout engine is pinned to vLLM's semantics (see
+    ``Scripts-Slime/grpo_vlm_geo3k_nemotron3.5/docs/08_vllm_parity_vision_path.md``),
+    and the actor has to match it or every rollout log-prob is computed against a
+    different vision tower than the one that produced the tokens. Both edits are
+    made here, on the reference modules, rather than reimplemented downstream, so
+    that the trainer and the engine differ from the released checkpoint in
+    exactly the same two places and nowhere else.
+
+    1. ``vision_projector.vision_final_layernorm``. The checkpoint carries it and
+       the reference applies it at the top of ``_project``; vLLM's
+       ``nano_nemotron_vl.py`` has no such module at all (the architecture is
+       aliased onto ``NemotronH_Nano_VL_V2``, whose prefix-routing
+       ``load_weights`` has no else branch, so the two tensors are dropped).
+       Setting it to ``None`` is the reference's own "no norm" path --
+       ``_project`` is written as ``if self.vision_final_layernorm is not None``
+       -- so this removes the op without editing remote code.
+
+    2. ``encoder.layer.{i}.layer_scale{1,2}``. C-RADIO ships no LayerScale; the
+       module is inherited and ``layerscale_value`` is 1.0, so ``x * lambda1`` is
+       the identity at load time. vLLM builds ``ls1``/``ls2`` as ones and then
+       refuses to load them (``radio.py:733-734`` skips the suffix outright), so
+       its gate is a construction-time constant. Ours was a live parameter --
+       this tower is not frozen in the GRPO recipe, so the optimizer moved it off
+       1.0 from the first step. ``nn.Identity`` pins it the way vLLM pins it, and
+       it is exact rather than approximate: ``x * 1.0 == x``.
+    """
+    if getattr(vision_projector, "vision_final_layernorm", None) is None:
+        raise ValueError(
+            "Nemotron 3.5 Super VL projector has no vision_final_layernorm to strip. "
+            "Either the checkpoint is not a Super VL one (llm_config.num_nextn_predict_layers "
+            "must be > 0) or the remote code changed; vLLM parity cannot be asserted blind."
+        )
+    vision_projector.vision_final_layernorm = None
+
+    encoder = getattr(vision_model, "encoder", None)
+    if encoder is None:
+        raise ValueError("RadioModel has no .encoder; cannot locate the LayerScale modules")
+    replaced = 0
+    for layer in encoder.layer:
+        for attribute in ("layer_scale1", "layer_scale2"):
+            if isinstance(getattr(layer, attribute, None), torch.nn.Identity):
+                continue
+            setattr(layer, attribute, torch.nn.Identity())
+            replaced += 1
+    expected = 2 * len(encoder.layer)
+    if replaced != expected:
+        raise ValueError(f"expected to replace {expected} RADIO LayerScale modules, replaced {replaced}")
+
+
 def _load_vision_modules(hf_checkpoint: str, hf_config, dtype: torch.dtype, use_cpu_initialization: bool):
     """Build the RADIO tower and the projector from the checkpoint's remote code."""
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -83,6 +142,8 @@ def _load_vision_modules(hf_checkpoint: str, hf_config, dtype: torch.dtype, use_
     # Leaving it in would normalize twice.
     if hasattr(vision_model, "make_preprocessor_external"):
         vision_model.make_preprocessor_external()
+
+    _align_vision_modules_with_vllm(vision_model, vision_projector)
 
     vision_model.to(dtype=dtype)
     vision_projector.to(dtype=dtype)
@@ -246,8 +307,9 @@ class NemotronHVLModel(MegatronModule):
         # path -- cat-then-flatten and flatten-then-cat produce the same row
         # order -- so it is a strict generalisation, not a behaviour change.
         # Calling the projector per single tensor also keeps its own _project,
-        # and with it the vision_final_layernorm that only Super checkpoints
-        # carry.
+        # which is where pixel shuffle and `mlp1` live. (_project's
+        # vision_final_layernorm branch is inert here --
+        # _align_vision_modules_with_vllm set it to None.)
         projector_dtype = next(self.vision_projector.parameters()).dtype
         if isinstance(pixel_values, (list, tuple)):
             per_image = []
