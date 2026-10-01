@@ -38,8 +38,8 @@ not raise. It produces an engine running partly stale weights and a quietly
 wrong ``train_rollout_logprob_abs_diff``, which is why every line below is
 pinned to a checkpoint key or to a named sglang parameter.
 
-Two places where this is more than a rename
--------------------------------------------
+Where this is more than a rename -- one rule, and one deliberate absence
+------------------------------------------------------------------------
   * **Fused qkv.** RadioModel spells attention as three Linears
     (``attention.attention.{query,key,value}``); the checkpoint and sglang both
     want one ``attn.qkv``. The load direction splits it with ``Chunk(dim=0)``
@@ -50,16 +50,20 @@ Two places where this is more than a rename
     with no shard id (models/radio.py:598), i.e. it only accepts the fused form;
     emitting q/k/v separately would hit the silent-drop path above.
 
-  * **LayerScale.** ``encoder.layer.{i}.layer_scale{1,2}.lambda1`` has no
-    checkpoint counterpart at all -- C-RADIO ViT-H ships no layerscale, and the
-    load direction synthesises it as ``layerscale_value * ones`` precisely
-    because it is absent. But it *is* an nn.Parameter on both sides (this tower
-    is not frozen in the GRPO recipe, so it trains), and sglang's layer does
-    carry one, as ``ls1``/``ls2`` (models/internvl.py:249-250). So these map to
-    ``...blocks.{i}.ls{1,2}``, which is the one target below that is a named
-    sglang parameter rather than a checkpoint key. Dropping them instead would
-    leave the engine on the init value and diverge from the trainer as soon as
-    the first optimizer step moved them.
+  * **LayerScale -- no longer here at all.** ``encoder.layer.{i}.layer_scale{1,2}
+    .lambda1`` used to be mapped to sglang's ``...blocks.{i}.ls{1,2}``, because
+    the parameter existed on both sides and nothing else would have written it.
+    It no longer exists on either side: C-RADIO ViT-H ships no layerscale,
+    ``layerscale_value`` is 1.0, and both sides now decline to materialise an
+    identity -- ``_load_vision_modules`` replaces the module with ``nn.Identity``
+    (slime_plugins/models/nemotron_h_vl.py) and sglang skips the ``nn.Parameter``
+    for ``model_type == "radio"`` (models/internvl.py:249-250).
+
+    So there is no rule for it below, and nothing to write: the name cannot
+    appear in ``named_parameters()``, which is what drives this converter. The
+    two changes are a pair -- exporting without the sglang half would leave the
+    engine on its own init value, which is the failure this mapping originally
+    existed to prevent.
 
 Buffers -- ``input_conditioner.norm_{mean,std}`` and ``summary_idxs`` -- are not
 parameters, and the weight sync only walks ``named_parameters()`` plus
@@ -137,12 +141,6 @@ def _convert_vision(rest: str, param: torch.Tensor):
         if qkv_match:
             component, suffix = qkv_match.groups()
             return _fuse_qkv(block_idx, component, suffix, param)
-
-        # LayerScale: no checkpoint key, but sglang's layer has ls1/ls2. See the
-        # module docstring for why this is mapped rather than dropped.
-        layer_scale_match = re.fullmatch(r"layer_scale([12])\.lambda1", inner)
-        if layer_scale_match:
-            return [(f"vision_model.radio_model.model.blocks.{block_idx}.ls{layer_scale_match.group(1)}", param)]
 
         for source, target in _VISION_BLOCK_RENAMES:
             if inner == source or inner.startswith(f"{source}."):

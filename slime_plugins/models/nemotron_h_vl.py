@@ -81,6 +81,28 @@ def _load_vision_modules(hf_checkpoint: str, hf_config, dtype: torch.dtype, use_
     if hasattr(vision_model, "make_preprocessor_external"):
         vision_model.make_preprocessor_external()
 
+    # C-RADIO ships no LayerScale, but RadioLayer builds one unconditionally
+    # (modeling_radio.py:372,381) as `layerscale_value * ones(hidden_size)`.
+    # layerscale_value is 1.0 for this checkpoint -- configuration_radio.py:67
+    # says so in as many words ("C-RADIO has no layerscale; 1.0 makes the
+    # (inherited) layerscale an identity op") -- so `hidden_state * lambda1` is
+    # the identity, the released index carries no key for it, and the HF loader
+    # has to excuse 64 missing keys to load at all (_keys_to_ignore_on_load_missing,
+    # modeling_radio.py:412).
+    #
+    # Materialising an identity as an nn.Parameter is not free here. It puts 64
+    # names in named_parameters() that no checkpoint writes and no loader owns,
+    # it holds device memory inside the pool a colocated engine releases, and --
+    # because this tower is not frozen in the GRPO recipe -- the optimizer moves
+    # it, so trainer and engine have to stay in sync on a constant. Dropping the
+    # module is exact rather than an approximation, and it is the encoding
+    # RadioLayer already uses one line further down for drop_path
+    # (modeling_radio.py:373). sglang's side of this is internvl.py:249-250.
+    if getattr(hf_config.vision_config, "layerscale_value", None) == 1.0:
+        for layer in vision_model.encoder.layer:
+            layer.layer_scale1 = torch.nn.Identity()
+            layer.layer_scale2 = torch.nn.Identity()
+
     vision_model.to(dtype=dtype)
     vision_projector.to(dtype=dtype)
 

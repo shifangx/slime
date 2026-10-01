@@ -82,31 +82,16 @@ _VISION_RENAMES = (
 _VISION_BLOCK_RENAMES = (("attention.output.dense", "attn.proj"),)
 
 
-def _vision_config(hf_config):
-    vision_config = getattr(hf_config, "vision_config", None)
-    if vision_config is None:
-        raise KeyError("Nemotron omni config has no vision_config")
-    return vision_config
-
-
 def _vision_tensor(rest: str, reader: SafetensorReader, hf_config) -> torch.Tensor:
     """Resolve one RadioModel parameter name against the C-RADIO checkpoint."""
 
-    # LayerScale is the one parameter with no checkpoint counterpart at all.
-    # C-RADIO ViT-H has no layerscale, but RadioLayer builds one unconditionally
-    # (modeling_radio.py:372,381) as `layerscale_value * ones(hidden_size)`, and
-    # layerscale_value is 1.0 here -- so `hidden_state * lambda1` is the
-    # identity and the reference model loads with these as missing keys left at
-    # their init value. Synthesising that value is what keeps the two models
-    # numerically equal; raising here, or loading zeros, would not.
-    if re.fullmatch(r"encoder\.layer\.\d+\.layer_scale[12]\.lambda1", rest):
-        vision_config = _vision_config(hf_config)
-        return torch.full(
-            (vision_config.hidden_size,),
-            float(vision_config.layerscale_value),
-            dtype=torch.float32,
-        )
-
+    # LayerScale used to be synthesised here as `layerscale_value * ones`: it is
+    # the one parameter with no checkpoint counterpart at all, because C-RADIO
+    # ViT-H has no layerscale while RadioLayer builds one unconditionally
+    # (modeling_radio.py:372,381). `_load_vision_modules` now replaces that
+    # module with nn.Identity when layerscale_value is 1.0, so the name can no
+    # longer reach this function -- it is driven by the Megatron model's own
+    # named_parameters(), and the parameter is gone.
     for source, target in _VISION_RENAMES:
         if rest == source or rest.startswith(f"{source}."):
             rest = target + rest[len(source) :]
