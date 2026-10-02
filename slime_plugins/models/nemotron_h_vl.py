@@ -332,6 +332,17 @@ class NemotronHVLModel(MegatronModule):
         if packed_seq_params is None:
             raise ValueError("Nemotron 3.5 VL native training currently requires packed sequences")
 
+        # slime asks for the MTP loss GPTModel's way, with
+        # mtp_kwargs={"mtp_labels": tokens} (backends/megatron_utils/model.py, only
+        # under --enable-mtp-training). HybridModel takes no such argument: it
+        # derives the MTP labels from input_ids itself -- the same tensor as
+        # mtp_labels here -- and gates the branch on compute_mtp_loss, which
+        # defaults to True. So translate rather than forward: without this the
+        # call would raise on the unknown kwarg, and with MTP layers built but
+        # training off, dropping the kwarg alone would still train them.
+        mtp_kwargs = kwargs.pop("mtp_kwargs", None)
+        kwargs["compute_mtp_loss"] = mtp_kwargs is not None
+
         decoder_input = None
         if self.pre_process:
             if pixel_values is None:
@@ -393,9 +404,15 @@ def get_hybrid_override_pattern(args, hf_config) -> str:
             "checkpoint whose config carries hybrid_override_pattern or layers_block_type."
         )
 
-    if len(pattern) != args.num_layers:
+    # MCore's unified spelling may append MTP depths after '/' -- '<main>/*E/*E'
+    # is two depths of the checkpoint's attention+MoE MTP layer. Only the main
+    # stack counts towards --num-layers (hybrid_layer_allocation.py:
+    # get_hybrid_total_layer_count), and the whole string goes to HybridModel,
+    # which builds the MTP block from the segments after the separator.
+    main_pattern = pattern.split("/")[0]
+    if len(main_pattern) != args.num_layers:
         raise ValueError(
-            f"hybrid layer pattern is {len(pattern)} characters but --num-layers is "
+            f"hybrid layer pattern has {len(main_pattern)} main-stack characters but --num-layers is "
             f"{args.num_layers}; every layer needs a symbol."
         )
     return pattern

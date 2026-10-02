@@ -122,6 +122,26 @@ def _merge_qkv(reader: SafetensorReader, prefix: str, hf_config) -> torch.Tensor
     return torch.cat((q, k, v), dim=1).reshape(-1, *trailing).contiguous()
 
 
+_BLOCK_TYPE_SYMBOLS = {"mamba": "M", "moe": "E", "attention": "*"}
+
+
+def mtp_pattern(hf_config) -> str:
+    """The per-depth MTP layer pattern, e.g. '*E' for Nemotron 3 / 3.5 Super.
+
+    Nemotron 3's config spells it ``mtp_hybrid_override_pattern``; 3.5 spells it
+    as an ``mtp_layers_block_type`` list. Either way it is ONE depth's worth of
+    layers -- the checkpoint stores a single MTP depth (num_nextn_predict_layers
+    1) at ``mtp.layers.{k}``, k indexing the layers of that depth.
+    """
+    pattern = getattr(hf_config, "mtp_hybrid_override_pattern", None)
+    if pattern:
+        return pattern
+    block_types = getattr(hf_config, "mtp_layers_block_type", None)
+    if not block_types:
+        raise KeyError("Nemotron-H config has neither mtp_hybrid_override_pattern nor mtp_layers_block_type")
+    return "".join(_BLOCK_TYPE_SYMBOLS[block] for block in block_types)
+
+
 def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torch.Tensor:
     """Return the full, unsharded MCore tensor for a Nemotron-H parameter name."""
 
@@ -142,6 +162,10 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
     if name in direct:
         return reader.get_tensor(direct[name])
 
+    mtp_match = re.fullmatch(r"mtp\.layers\.(\d+)\.(.+)", name)
+    if mtp_match:
+        return _mtp_tensor(mtp_match.group(2), reader, hf_config, name)
+
     layer_match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
     if not layer_match:
         raise KeyError(f"Unsupported Nemotron-H Megatron parameter {name!r}")
@@ -154,9 +178,48 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
     pattern = pattern.split("/")[0]
     if layer_idx >= len(pattern):
         raise KeyError(f"Layer {layer_idx} is past the end of hybrid_override_pattern ({len(pattern)} layers)")
-    symbol = pattern[layer_idx]
+    return _layer_tensor(pattern[layer_idx], f"backbone.layers.{layer_idx}", rest, reader, hf_config, name)
 
-    hf = f"backbone.layers.{layer_idx}"
+
+def _mtp_tensor(rest: str, reader: SafetensorReader, hf_config, name: str) -> torch.Tensor:
+    """One MCore MTP parameter, from the checkpoint's single MTP depth.
+
+    MCore's hybrid MTP layer (transformer/multi_token_prediction.py) wraps the
+    depth's layers in a nested HybridStack and keeps the depth-level pieces
+    outside it; the checkpoint flattens the same thing into ``mtp.layers.{k}``,
+    with the depth-level pieces on the first and last layer:
+
+        MCore  mtp.layers.{d}.<rest>                  HF  mtp.layers.{k}.<...>
+        ------------------------------------------    -------------------------------
+        enorm / hnorm / eh_proj                       0.enorm / 0.hnorm / 0.eh_proj
+        final_layernorm                               {P-1}.final_layernorm
+        mtp_model_layer.layers.{k}.<layer param>      {k}.<same rules as a decoder layer>
+
+    (P = layers per depth.) eh_proj needs no reordering: MCore concatenates
+    [enorm(embedding), hnorm(hidden)] (_concat_embeddings), the same order the
+    checkpoint's weight was trained for and SGLang's nemotron_h_mtp.py uses.
+
+    Every depth d reads the checkpoint's one depth. With --mtp-use-repeated-layer
+    (the Nemotron recipe: one MTP layer applied once per depth) MCore builds
+    d = 0 only; without it, every depth starts from the same weights.
+    """
+    pattern = mtp_pattern(hf_config)
+    if rest in {"enorm.weight", "hnorm.weight", "eh_proj.weight"}:
+        return reader.get_tensor(f"mtp.layers.0.{rest}")
+    if rest == "final_layernorm.weight":
+        return reader.get_tensor(f"mtp.layers.{len(pattern) - 1}.final_layernorm.weight")
+
+    inner = re.fullmatch(r"mtp_model_layer\.layers\.(\d+)\.(.+)", rest)
+    if not inner:
+        raise KeyError(f"Unsupported Nemotron-H MTP parameter {name!r}")
+    k, inner_rest = int(inner.group(1)), inner.group(2)
+    if k >= len(pattern):
+        raise KeyError(f"MTP inner layer {k} is past the end of the MTP pattern {pattern!r} ({name!r})")
+    return _layer_tensor(pattern[k], f"mtp.layers.{k}", inner_rest, reader, hf_config, name)
+
+
+def _layer_tensor(symbol: str, hf: str, rest: str, reader: SafetensorReader, hf_config, name: str) -> torch.Tensor:
+    """One parameter of one M / E / * layer; ``hf`` is that layer's checkpoint prefix."""
     # Every layer type has the same pre-mixer norm on the HF side; MCore reaches
     # it under three different names depending on what the layer is.
     pre_norm_names = {
@@ -229,4 +292,4 @@ def nemotron_h_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torc
             return reader.get_tensor(f"{hf}.mixer.shared_experts.{shared[rest]}.weight")
         raise KeyError(f"Unsupported Nemotron-H MoE parameter {name!r}")
 
-    raise KeyError(f"Layer {layer_idx} has unknown hybrid symbol {symbol!r} for parameter {name!r}")
+    raise KeyError(f"{hf} has unknown hybrid symbol {symbol!r} for parameter {name!r}")

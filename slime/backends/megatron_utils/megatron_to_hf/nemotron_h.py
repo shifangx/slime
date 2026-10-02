@@ -99,6 +99,10 @@ def convert_nemotron_h_to_hf(args, name, param):
     if name in direct:
         return [(direct[name], param)]
 
+    mtp_match = re.fullmatch(r"mtp\.layers\.(\d+)\.(.+)", name)
+    if mtp_match:
+        return _convert_mtp(int(mtp_match.group(1)), mtp_match.group(2), param, args, name)
+
     layer_match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
     if not layer_match:
         raise ValueError(f"Unsupported Nemotron-H Megatron parameter {name!r}")
@@ -106,9 +110,48 @@ def convert_nemotron_h_to_hf(args, name, param):
     layer_idx = int(layer_idx)
 
     pattern = args.hybrid_override_pattern.split("/")[0]
-    symbol = pattern[layer_idx]
-    hf = f"backbone.layers.{layer_idx}"
+    return _convert_layer(pattern[layer_idx], f"backbone.layers.{layer_idx}", rest, param, args, name)
 
+
+def _convert_mtp(depth: int, rest: str, param, args, name: str):
+    """One MCore MTP parameter -> the checkpoint's single MTP depth.
+
+    The inverse of hf_to_megatron/nemotron_h.py::_mtp_tensor (see its table).
+    SGLang's draft (models/nemotron_h_mtp.py, loaded with is_mtp=True) takes
+    exactly these ``mtp.layers.{k}.*`` names, and the RL weight sync hands it
+    the same tensors as the target (speculative/eagle_worker_v2.py
+    update_weights_from_tensor), so this is what keeps the draft on the
+    trained MTP weights.
+
+    The checkpoint -- and therefore the draft -- has ONE MTP depth, which the
+    engine applies once per speculative step. Only a repeated MCore layer
+    (--mtp-use-repeated-layer, depth 0 only) maps onto it one-to-one; distinct
+    per-depth weights would all have to land on the same names.
+    """
+    if depth != 0:
+        raise ValueError(
+            f"{name!r}: MTP depth {depth} has no checkpoint counterpart. The Nemotron-H checkpoint and "
+            "SGLang's draft hold one MTP depth; train it with --mtp-use-repeated-layer."
+        )
+    parts = args.hybrid_override_pattern.split("/")
+    if len(parts) < 2 or not parts[1]:
+        raise ValueError(f"{name!r}: --hybrid-override-pattern has no MTP segment ('<main>/<mtp>/...')")
+    pattern = parts[1]
+
+    if rest in {"enorm.weight", "hnorm.weight", "eh_proj.weight"}:
+        return [(f"mtp.layers.0.{rest}", param)]
+    if rest == "final_layernorm.weight":
+        return [(f"mtp.layers.{len(pattern) - 1}.final_layernorm.weight", param)]
+
+    inner = re.fullmatch(r"mtp_model_layer\.layers\.(\d+)\.(.+)", rest)
+    if not inner:
+        raise ValueError(f"Unsupported Nemotron-H MTP parameter {name!r}")
+    k, inner_rest = int(inner.group(1)), inner.group(2)
+    return _convert_layer(pattern[k], f"mtp.layers.{k}", inner_rest, param, args, name)
+
+
+def _convert_layer(symbol: str, hf: str, rest: str, param, args, name: str):
+    """One parameter of one M / E / * layer; ``hf`` is that layer's checkpoint prefix."""
     # The pre-mixer norm, whichever linear MCore folded it into.
     if rest in {
         "mixer.in_proj.layer_norm_weight",
@@ -171,4 +214,4 @@ def convert_nemotron_h_to_hf(args, name, param):
             return [(f"{hf}.mixer.shared_experts.{shared[rest]}.weight", param)]
         raise ValueError(f"Unsupported Nemotron-H MoE parameter {name!r}")
 
-    raise ValueError(f"Layer {layer_idx} has unknown hybrid symbol {symbol!r} for parameter {name!r}")
+    raise ValueError(f"{hf} has unknown hybrid symbol {symbol!r} for parameter {name!r}")
