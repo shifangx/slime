@@ -343,6 +343,17 @@ class NemotronHVLModel(MegatronModule):
         mtp_kwargs = kwargs.pop("mtp_kwargs", None)
         kwargs["compute_mtp_loss"] = mtp_kwargs is not None
 
+        # The MTP branch rolls position_ids together with input_ids and asserts
+        # they exist (hybrid_model.py:606), but slime never passes any: the main
+        # stack is NoPE and GPTModel's MTP path does not insist. Number the tokens
+        # within each packed sequence, as MCore's own get_batch would. Under
+        # position_embedding_type 'none' the values are not read, so this only has
+        # to be well-formed -- but it is also the correct value if that changes.
+        if kwargs["compute_mtp_loss"] and position_ids is None:
+            position_ids = _packed_position_ids(
+                packed_seq_params.cu_seqlens_q, input_ids, mpu.get_context_parallel_group()
+            )
+
         decoder_input = None
         if self.pre_process:
             if pixel_values is None:
@@ -370,6 +381,28 @@ class NemotronHVLModel(MegatronModule):
             loss_mask=loss_mask,
             **kwargs,
         )
+
+
+def _packed_position_ids(cu_seqlens: torch.Tensor, input_ids: torch.Tensor, cp_group) -> torch.Tensor:
+    """[1, local tokens] positions, restarting at 0 at every packed-sequence boundary.
+
+    Built over the full packed stream (cu_seqlens describes all of it) and, under
+    CP, cut down to this rank's two-chunk slice with the same index map the
+    vision injection uses, so it lines up with input_ids token for token.
+    """
+    cu_seqlens = cu_seqlens.to(device=input_ids.device, dtype=torch.long)
+    total = int(cu_seqlens[-1])
+    starts = torch.repeat_interleave(cu_seqlens[:-1], cu_seqlens[1:] - cu_seqlens[:-1])
+    positions = torch.arange(total, device=input_ids.device) - starts
+    if cp_group is not None and cp_group.size() > 1:
+        positions = positions[
+            get_packed_cp_local_indices(cu_seqlens, cp_group.size(), cp_group.rank(), input_ids.device)
+        ]
+    if positions.numel() != input_ids.shape[-1]:
+        raise ValueError(
+            f"MTP position_ids: {positions.numel()} positions from cu_seqlens, {input_ids.shape[-1]} local tokens"
+        )
+    return positions.view(1, -1)
 
 
 # 'M' Mamba2, 'E' MoE, '*' attention -- MCore's Symbols, and the three block
