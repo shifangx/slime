@@ -70,7 +70,9 @@ def qwen_vl_utils_spy(monkeypatch):
         calls.append(image_patch_size)
         return ["qwen-image"], None
 
-    monkeypatch.setitem(sys.modules, "qwen_vl_utils", types.SimpleNamespace(process_vision_info=fake_process_vision_info))
+    monkeypatch.setitem(
+        sys.modules, "qwen_vl_utils", types.SimpleNamespace(process_vision_info=fake_process_vision_info)
+    )
     return calls
 
 
@@ -142,7 +144,9 @@ def test_geo3k_train_and_rollout_sides_agree_on_every_image():
     images; with qwen_vl_utils they agree only because its resize hides the gap.
     """
     if not (GEO3K_DIR / "train.parquet").is_file() or not (NEMOTRON_VL_CKPT / "config.json").is_file():
-        pytest.skip(f"needs {GEO3K_DIR} and {NEMOTRON_VL_CKPT} (set SLIME_TEST_GEO3K_DIR / SLIME_TEST_NEMOTRON_VL_CKPT)")
+        pytest.skip(
+            f"needs {GEO3K_DIR} and {NEMOTRON_VL_CKPT} (set SLIME_TEST_GEO3K_DIR / SLIME_TEST_NEMOTRON_VL_CKPT)"
+        )
     pq = pytest.importorskip("pyarrow.parquet")
     internvl_utils = pytest.importorskip("sglang.srt.multimodal.internvl_utils")
 
