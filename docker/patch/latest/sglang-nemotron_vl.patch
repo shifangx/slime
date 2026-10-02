@@ -1,8 +1,8 @@
 From 535487a0c539fdaf7d5e786bb52ef672426312b0 Mon Sep 17 00:00:00 2001
 From: shifangx <shifangx@nvidia.com>
 Date: Mon, 21 Sep 2026 16:11:35 -0700
-Subject: [PATCH] feat(nemotron): serve Nemotron 3.5 Super VL, LayerNorm and
- all
+Subject: [PATCH 1/4] feat(nemotron): serve Nemotron 3.5 Super VL, LayerNorm
+ and all
 
 Super checkpoints declare architecture NemotronH_Omni_Reasoning_V3 and
 model_type nemotron_h_omni; only the Nano_ spellings were registered, so
@@ -50,7 +50,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  6 files changed, 149 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/configs/__init__.py b/python/sglang/srt/configs/__init__.py
-index aa05b73be721ab78e4c2f6ffa3f472041400073e..4e19327e327747f6258ec8862e3300281056e78a 100644
+index aa05b73be..4e19327e3 100644
 --- a/python/sglang/srt/configs/__init__.py
 +++ b/python/sglang/srt/configs/__init__.py
 @@ -27,6 +27,7 @@ from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionC
@@ -70,7 +70,7 @@ index aa05b73be721ab78e4c2f6ffa3f472041400073e..4e19327e327747f6258ec8862e330028
      "JetVLMConfig",
      "Step3p5Config",
 diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
-index debcc7f535740b5405fa898a50c75c7c2aa0a508..fa8dab9934c9c39310119adc9fa211624d9e32de 100644
+index debcc7f53..fa8dab993 100644
 --- a/python/sglang/srt/configs/model_config.py
 +++ b/python/sglang/srt/configs/model_config.py
 @@ -1665,6 +1665,7 @@ multimodal_model_archs = [
@@ -82,7 +82,7 @@ index debcc7f535740b5405fa898a50c75c7c2aa0a508..fa8dab9934c9c39310119adc9fa21162
      "Qwen2AudioForConditionalGeneration",
      "Qwen2VLForConditionalGeneration",
 diff --git a/python/sglang/srt/configs/nano_nemotron_vl.py b/python/sglang/srt/configs/nano_nemotron_vl.py
-index 888f94a1b43371ad587ec845393aef08a35ce30b..d947be9a11a6dc03a26d4e1ee7c2148b456eb578 100644
+index 888f94a1b..d947be9a1 100644
 --- a/python/sglang/srt/configs/nano_nemotron_vl.py
 +++ b/python/sglang/srt/configs/nano_nemotron_vl.py
 @@ -166,3 +166,28 @@ class NemotronH_Nano_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
@@ -115,7 +115,7 @@ index 888f94a1b43371ad587ec845393aef08a35ce30b..d947be9a11a6dc03a26d4e1ee7c2148b
 +        # Explicit __init__, same reason as above.
 +        super().__init__(*args, **kwargs)
 diff --git a/python/sglang/srt/models/nano_nemotron_vl.py b/python/sglang/srt/models/nano_nemotron_vl.py
-index bfd6cc128ac0e15d65cb1b8f490396d9b8cb055b..9b1e8ebc2073179041f265306261139ecc034cd2 100644
+index bfd6cc128..9b1e8ebc2 100644
 --- a/python/sglang/srt/models/nano_nemotron_vl.py
 +++ b/python/sglang/srt/models/nano_nemotron_vl.py
 @@ -176,6 +176,17 @@ class NemotronH_Nano_VL_V2(EVS):
@@ -263,7 +263,7 @@ index bfd6cc128ac0e15d65cb1b8f490396d9b8cb055b..9b1e8ebc2073179041f265306261139e
 +    NemotronH_Omni_Reasoning_V3,
 +]
 diff --git a/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py b/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
-index 32bab7ae44709e6fa6653b21aae8c3f55d927e85..9060d13a253de9c74610866b56eccf4113f9998a 100644
+index 32bab7ae4..9060d13a2 100644
 --- a/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
 +++ b/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
 @@ -22,6 +22,7 @@ from PIL import Image
@@ -304,7 +304,7 @@ index 32bab7ae44709e6fa6653b21aae8c3f55d927e85..9060d13a253de9c74610866b56eccf41
          )
          Image.MAX_IMAGE_PIXELS = None
 diff --git a/python/sglang/srt/utils/hf_transformers/common.py b/python/sglang/srt/utils/hf_transformers/common.py
-index eef80dc7a98508e7cb9974ef1979282309665725..4b1ede4cb8e49471cd5dc299c8cf836b52011573 100644
+index eef80dc7a..4b1ede4cb 100644
 --- a/python/sglang/srt/utils/hf_transformers/common.py
 +++ b/python/sglang/srt/utils/hf_transformers/common.py
 @@ -46,6 +46,7 @@ from sglang.srt.configs import (
@@ -323,6 +323,284 @@ index eef80dc7a98508e7cb9974ef1979282309665725..4b1ede4cb8e49471cd5dc299c8cf836b
          NemotronHConfig,
          NemotronHPuzzleConfig,
          DeepseekVLV2Config,
+-- 
+2.34.1
+
+
+From 0a80562893cf8d516ecd62820fbfe58f1edcc8c7 Mon Sep 17 00:00:00 2001
+From: shifangx <shifangx@nvidia.com>
+Date: Thu, 1 Oct 2026 04:55:46 -0700
+Subject: [PATCH 2/4] fix(radio): do not materialise ls1/ls2 for C-RADIO
+
+RadioConfig pins initializer_factor to 1.0 (configs/radio.py:73), so the
+LayerScale gate InternVisionEncoderLayer inherits is an identity for C-RADIO,
+and no RADIO checkpoint carries ls1/ls2. Building them anyway puts two
+nn.Parameters per layer in named_parameters() that a colocated RL weight sync
+then has to own for a constant, inside the pool release_memory_occupation
+gives back.
+
+Assign a plain Python float instead. `* self.ls1` in forward is unchanged --
+tensor * 1.0 is still valid -- so there is no device memory to lose and the
+value is re-derived in every process.
+
+Gated on model_type, not on initializer_factor: InternVisionConfig defaults it
+to 0.1 (configs/internvl.py:230), but real InternViT checkpoints do carry
+ls1/ls2 and InternVLChatModel.load_weights indexes params_dict unguarded, so
+dropping them for InternVL would be a KeyError. RadioModel.load_weights uses a
+guarded lookup and is unaffected either way. InternVL and InternS1 keep the
+nn.Parameter and their forward path is untouched.
+
+The trainer half of this is slime slime_plugins/models/nemotron_h_vl.py, which
+drops the matching RadioLayerScale modules. The two must ship together: with
+only one side changed the engine would serve ones while the trainer moved,
+with nothing in either log to say so.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ python/sglang/srt/models/internvl.py | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/models/internvl.py b/python/sglang/srt/models/internvl.py
+index a59fc1164..46c3ec6ad 100644
+--- a/python/sglang/srt/models/internvl.py
++++ b/python/sglang/srt/models/internvl.py
+@@ -246,8 +246,31 @@ class InternVisionEncoderLayer(nn.Module):
+         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
+         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
+ 
+-        self.ls1 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
+-        self.ls2 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
++        # C-RADIO reuses this layer but ships no LayerScale: RadioConfig pins
++        # initializer_factor to 1.0 (configs/radio.py:73) so the gate is an
++        # identity, and no RADIO checkpoint carries ls1/ls2. Materialising it
++        # anyway would put two nn.Parameters per layer in named_parameters()
++        # that the weight sync has to own for a constant, inside the pool
++        # release_memory_occupation gives back in a colocated run. A plain float
++        # keeps `* self.ls1` below working, costs no device memory, and is
++        # re-derived in every process. The trainer side of this is
++        # slime_plugins/models/nemotron_h_vl.py, which drops the matching
++        # RadioLayerScale modules -- the two halves must ship together.
++        #
++        # Gated on model_type, not on initializer_factor: InternViT defaults it
++        # to 0.1 (configs/internvl.py:230) but real InternViT checkpoints do
++        # carry ls1/ls2, and InternVLChatModel.load_weights indexes params_dict
++        # unguarded, so dropping them for InternVL would be a KeyError.
++        if getattr(config, "model_type", None) == "radio":
++            self.ls1 = 1.0
++            self.ls2 = 1.0
++        else:
++            self.ls1 = nn.Parameter(
++                config.initializer_factor * torch.ones(self.embed_dim)
++            )
++            self.ls2 = nn.Parameter(
++                config.initializer_factor * torch.ones(self.embed_dim)
++            )
+         self.drop_path1 = (
+             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+         )
+-- 
+2.34.1
+
+
+From 7b1755a7b90ecedda399421bd27bc35b373ec37e Mon Sep 17 00:00:00 2001
+From: shifangx <shifangx@nvidia.com>
+Date: Thu, 1 Oct 2026 23:45:12 -0700
+Subject: [PATCH 3/4] refactor(nemotron): drop the vision_final_layernorm
+ completeness check
+
+535487a0c made NemotronH_Omni_Reasoning_V3.load_weights raise on its
+first call unless both vision_projector.vision_final_layernorm.weight
+and .bias were loaded. That checks 2 of ~43k tensors. Nothing beneath
+it checks the rest: NemotronH_Nano_VL_V2.load_weights drops unknown
+prefixes with no else branch, NemotronHForCausalLM.load_weights only
+logs (or, for expert weights, silently skips) unmatched names, the
+RADIO loader's returned set is discarded, and DefaultModelLoader never
+compares loaded against expected parameters. A check that covers two
+tensors does not make the load complete, and it needed a first-call
+flag to stay quiet during RL bucketed syncs. Remove it, the flag, and
+the loaded set.
+
+Kept: rerouting those two tensors into self.vision_final_layernorm,
+and the raise when the checkpoint carries them but the model was built
+without the layer -- a structure mismatch, not a completeness check.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ python/sglang/srt/models/nano_nemotron_vl.py | 27 --------------------
+ 1 file changed, 27 deletions(-)
+
+diff --git a/python/sglang/srt/models/nano_nemotron_vl.py b/python/sglang/srt/models/nano_nemotron_vl.py
+index 9b1e8ebc2..688021346 100644
+--- a/python/sglang/srt/models/nano_nemotron_vl.py
++++ b/python/sglang/srt/models/nano_nemotron_vl.py
+@@ -442,10 +442,6 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+         else:
+             self.vision_final_layernorm = None
+ 
+-        # Set once the initial checkpoint load has been verified complete. See
+-        # load_weights: completeness is only a meaningful question on that call.
+-        self._vision_final_layernorm_checked = False
+-
+     def normalize_vision_features(self, vit_embeds: torch.Tensor) -> torch.Tensor:
+         if self.vision_final_layernorm is None:
+             return vit_embeds
+@@ -454,7 +450,6 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+         prefix = self._VISION_FINAL_LAYERNORM_PREFIX
+         remaining = []
+-        loaded = set()
+         for name, w in weights:
+             if not name.startswith(prefix):
+                 remaining.append((name, w))
+@@ -468,28 +463,6 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+             param = getattr(self.vision_final_layernorm, param_name)
+             with torch.no_grad():
+                 default_weight_loader(param, w)
+-            loaded.add(param_name)
+-
+-        # The base loader silently ignores names it does not recognize, so a
+-        # renamed or absent tensor here would otherwise leave the LayerNorm at
+-        # its init values -- identity-ish, wrong, and invisible in the log.
+-        #
+-        # That check only makes sense on the INITIAL load, which is the one
+-        # call that is handed the whole checkpoint. RL weight sync calls this
+-        # method again, once per bucket
+-        # (model_runner.py:_update_weights_from_flattened_bucket), and a bucket
+-        # is an arbitrary subset -- these two tensors are 2 of ~43k, so almost
+-        # every bucket carries neither, and a blanket assertion would fire on
+-        # the first sync of any RL run, on every rank at once.
+-        #
+-        # So: demand both on the first call, and assert nothing on the rest.
+-        if self.vision_final_layernorm is not None and not self._vision_final_layernorm_checked:
+-            if loaded != {"weight", "bias"}:
+-                raise ValueError(
+-                    f"expected {prefix}weight and {prefix}bias in the checkpoint, "
+-                    f"loaded {sorted(loaded)}"
+-                )
+-            self._vision_final_layernorm_checked = True
+ 
+         super().load_weights(remaining)
+ 
+-- 
+2.34.1
+
+
+From 816911dbf2097193471bcb146c73296047e5d398 Mon Sep 17 00:00:00 2001
+From: shifangx <shifangx@nvidia.com>
+Date: Fri, 2 Oct 2026 07:05:42 -0700
+Subject: [PATCH 4/4] feat(nemotron): MTP speculative decoding for Nemotron VL
+ / Omni targets
+
+The NemotronH MTP draft existed for the text architectures only. For a
+NemotronH_Omni_Reasoning_V3 (or Nano VL / Omni) target:
+
+- model_config: the draft is built from llm_config (a NemotronHConfig),
+  as NemotronHForCausalLMMTP; img_context_token_id is carried over.
+  Before, the "draft" was a second full VL model.
+- nemotron_h_mtp: load_weights strips the language_model. prefix the VL
+  checkpoint (and slime's weight sync) puts on mtp.*; without it every
+  MTP tensor was skipped silently and the draft ran on uninitialised
+  weights. forward maps multimodal pad ids (>= vocab_size) back to
+  <image>, so the MTP embeds that token's own vector -- what Megatron's
+  MTP sees in training -- instead of indexing past the vocabulary.
+- nano_nemotron_vl: get/set_embed_and_head delegate to the language
+  model, which EAGLE needs to share embedding and LM head with the draft.
+
+Not yet run on GPUs; first end-to-end run is slime GRPO job 6139510.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ python/sglang/srt/configs/model_config.py    | 16 +++++++++++++++
+ python/sglang/srt/models/nano_nemotron_vl.py |  9 +++++++++
+ python/sglang/srt/models/nemotron_h_mtp.py   | 21 ++++++++++++++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index fa8dab993..4d632842a 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -609,6 +609,22 @@ class ModelConfig:
+             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
+             self.hf_config.num_nextn_predict_layers = 1
+ 
++        # The Nemotron VL / Omni wrappers carry the language model as llm_config, a
++        # NemotronHConfig, and the MTP head belongs to it: the checkpoint stores it at
++        # language_model.mtp.*. The draft is a text-only NemotronH MTP head, so build
++        # it from llm_config and let the mapping below pick the MTP class.
++        if is_draft_model and self.hf_config.architectures[0] in [
++            "NemotronH_Nano_VL_V2",
++            "NemotronH_Nano_Omni_Reasoning_V3",
++            "NemotronH_Omni_Reasoning_V3",
++        ]:
++            vl_config = self.hf_config
++            self.hf_config = vl_config.llm_config
++            self.hf_config.architectures = ["NemotronHForCausalLM"]
++            # NemotronHForCausalLMMTP maps multimodal pad ids back to this token.
++            self.hf_config.img_context_token_id = vl_config.img_context_token_id
++            self.hf_text_config = get_hf_text_config(self.hf_config)
++
+         if is_draft_model and self.hf_config.architectures[0] in [
+             "NemotronHForCausalLM",
+             "NemotronHPuzzleForCausalLM",
+diff --git a/python/sglang/srt/models/nano_nemotron_vl.py b/python/sglang/srt/models/nano_nemotron_vl.py
+index 688021346..c7a0a6f6d 100644
+--- a/python/sglang/srt/models/nano_nemotron_vl.py
++++ b/python/sglang/srt/models/nano_nemotron_vl.py
+@@ -116,6 +116,15 @@ class NemotronH_Nano_VL_V2(EVS):
+ 
+         self.config = config
+ 
++    # EAGLE / MTP speculative decoding shares the target's embedding and LM head
++    # with the draft (NemotronHForCausalLMMTP), and asks the *outer* model for
++    # them. Both live on the language model.
++    def get_embed_and_head(self):
++        return self.language_model.get_embed_and_head()
++
++    def set_embed_and_head(self, embed, head):
++        self.language_model.set_embed_and_head(embed, head)
++
+     def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+         im_start_id: int = mm_inputs.im_start_id
+         im_end_id: int = mm_inputs.im_end_id
+diff --git a/python/sglang/srt/models/nemotron_h_mtp.py b/python/sglang/srt/models/nemotron_h_mtp.py
+index 189e364b9..14b3e07e2 100644
+--- a/python/sglang/srt/models/nemotron_h_mtp.py
++++ b/python/sglang/srt/models/nemotron_h_mtp.py
+@@ -355,6 +355,21 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
+     ) -> torch.Tensor:
+         hidden_states = forward_batch.spec_info.hidden_states
+ 
++        # Draft of a Nemotron VL / Omni target (model_config.py sets this). The
++        # scheduler has replaced every <image> id with a per-image pad value
++        # (MM_PAD_SHIFT_VALUE + hash, always >= vocab_size). Map those back to
++        # <image> so the MTP embeds that token's own vector, which is what
++        # Megatron's MTP sees during training (HybridModel passes input_ids to
++        # embedding(), not the vision-injected decoder input). Only images are
++        # handled: video / audio pads would also land on <image>.
++        img_context_token_id = getattr(self.config, "img_context_token_id", None)
++        if img_context_token_id is not None and input_embeds is None:
++            input_ids = torch.where(
++                input_ids >= self.config.vocab_size,
++                torch.full_like(input_ids, img_context_token_id),
++                input_ids,
++            )
++
+         hidden_states = self.model(
+             input_ids,
+             hidden_states,
+@@ -368,6 +383,12 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
+     def load_weights(
+         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
+     ):
++        # Nemotron VL / Omni checkpoints -- and slime's weight sync for them --
++        # name the MTP head language_model.mtp.*. Without this strip the parent
++        # would map it to language_model.model.layers.*, find no such parameter
++        # and skip it, leaving the draft on uninitialised weights. Vision keys
++        # carry no "mtp" and are dropped by the parent as before.
++        weights = ((name.removeprefix("language_model."), w) for name, w in weights)
+         super().load_weights(weights, is_mtp=True)
+ 
+ 
 -- 
 2.34.1
 
