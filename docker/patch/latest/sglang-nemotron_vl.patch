@@ -1,7 +1,7 @@
 From 535487a0c539fdaf7d5e786bb52ef672426312b0 Mon Sep 17 00:00:00 2001
 From: shifangx <shifangx@nvidia.com>
 Date: Mon, 21 Sep 2026 16:11:35 -0700
-Subject: [PATCH 1/4] feat(nemotron): serve Nemotron 3.5 Super VL, LayerNorm
+Subject: [PATCH 1/5] feat(nemotron): serve Nemotron 3.5 Super VL, LayerNorm
  and all
 
 Super checkpoints declare architecture NemotronH_Omni_Reasoning_V3 and
@@ -330,7 +330,7 @@ index eef80dc7a..4b1ede4cb 100644
 From 0a80562893cf8d516ecd62820fbfe58f1edcc8c7 Mon Sep 17 00:00:00 2001
 From: shifangx <shifangx@nvidia.com>
 Date: Thu, 1 Oct 2026 04:55:46 -0700
-Subject: [PATCH 2/4] fix(radio): do not materialise ls1/ls2 for C-RADIO
+Subject: [PATCH 2/5] fix(radio): do not materialise ls1/ls2 for C-RADIO
 
 RadioConfig pins initializer_factor to 1.0 (configs/radio.py:73), so the
 LayerScale gate InternVisionEncoderLayer inherits is an identity for C-RADIO,
@@ -405,7 +405,7 @@ index a59fc1164..46c3ec6ad 100644
 From 7b1755a7b90ecedda399421bd27bc35b373ec37e Mon Sep 17 00:00:00 2001
 From: shifangx <shifangx@nvidia.com>
 Date: Thu, 1 Oct 2026 23:45:12 -0700
-Subject: [PATCH 3/4] refactor(nemotron): drop the vision_final_layernorm
+Subject: [PATCH 3/5] refactor(nemotron): drop the vision_final_layernorm
  completeness check
 
 535487a0c made NemotronH_Omni_Reasoning_V3.load_weights raise on its
@@ -488,7 +488,7 @@ index 9b1e8ebc2..688021346 100644
 From 816911dbf2097193471bcb146c73296047e5d398 Mon Sep 17 00:00:00 2001
 From: shifangx <shifangx@nvidia.com>
 Date: Fri, 2 Oct 2026 07:05:42 -0700
-Subject: [PATCH 4/4] feat(nemotron): MTP speculative decoding for Nemotron VL
+Subject: [PATCH 4/5] feat(nemotron): MTP speculative decoding for Nemotron VL
  / Omni targets
 
 The NemotronH MTP draft existed for the text architectures only. For a
@@ -601,6 +601,47 @@ index 189e364b9..14b3e07e2 100644
          super().load_weights(weights, is_mtp=True)
  
  
+-- 
+2.34.1
+
+
+From 09634e8003c942ab39d8099b9f256df6e1778797 Mon Sep 17 00:00:00 2001
+From: shifangx <shifangx@nvidia.com>
+Date: Fri, 2 Oct 2026 16:52:15 -0700
+Subject: [PATCH 5/5] fix(nemotron): pass layer_id to the MoE TopK for
+ routed-experts capture
+
+The routed-experts capturer (return_routed_experts, used by rollout
+routing replay) writes buffer[:n, layer_id, :]. NemotronHMoE built its
+TopK without layer_id, so the write became buffer[:n, None, :] and
+failed during CUDA graph capture:
+
+  The expanded size of the tensor (88) must match the existing size
+  (279) at non-singleton dimension 2. Target sizes: [279, 1, 88, 22].
+
+layer_idx is the global hybrid-layer index, which is what the capture
+buffer (num_hidden_layers wide) is indexed by. The MTP draft opts out of
+capture generically (disable_routed_experts_capture_for_draft).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ python/sglang/srt/models/nemotron_h.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/python/sglang/srt/models/nemotron_h.py b/python/sglang/srt/models/nemotron_h.py
+index 1fc5fe2f0..966f8ac21 100644
+--- a/python/sglang/srt/models/nemotron_h.py
++++ b/python/sglang/srt/models/nemotron_h.py
+@@ -206,6 +206,9 @@ class NemotronHMoE(nn.Module):
+         )
+         self.topk = TopK(
+             top_k=config.num_experts_per_tok,
++            # Routed-experts capture (return_routed_experts) indexes its buffer
++            # by layer_id; without it every MoE layer writes the whole buffer.
++            layer_id=layer_idx,
+             use_grouped_topk=True,
+             topk_group=config.topk_group,
+             num_expert_group=config.n_group,
 -- 
 2.34.1
 
