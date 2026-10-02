@@ -90,12 +90,17 @@ def get_batch(
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.device()) * cp_size
 
     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+    # total_tokens makes PackedSeqParams derive seq_idx, which Mamba's conv1d and
+    # SSM scan need to reset their state at sequence boundaries. Without it, a
+    # micro-batch packing several samples runs them as one sequence and every
+    # sample after the first inherits the previous one's state.
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         qkv_format="thd",
+        total_tokens=int(cu_seqlens[-1].item()),
     )
 
     tokens = tokens.unsqueeze(0)
