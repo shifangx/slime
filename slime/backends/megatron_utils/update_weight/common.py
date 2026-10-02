@@ -168,15 +168,20 @@ def named_params_and_buffers(args: Namespace, model: Sequence[torch.nn.Module]) 
 
                 # MTP layer indices start from 0
                 layer_idx, rest = match.groups()
-                expert_pattern = r"transformer_layer\.mlp\.experts\.(.+)\.(weight|bias)(\d+)"
-                match = re.match(expert_pattern, rest)
+                # The experts sit at `transformer_layer.mlp.experts.` in a GPT MTP layer
+                # and at `mtp_model_layer.layers.{k}.mlp.experts.` in a hybrid one
+                # (HybridModel nests a HybridStack). Either way the index is EP-local
+                # and has to be made global, or every EP rank publishes its slice
+                # under the same names 0..n_local-1.
+                expert_pattern = r"(.*?)mlp\.experts\.(.+)\.(weight|bias)(\d+)"
+                match = re.fullmatch(expert_pattern, rest)
                 if not match:
                     yield name, param
                     continue
 
-                rest, param_type, expert_idx = match.groups()
+                layer_path, rest, param_type, expert_idx = match.groups()
                 expert_idx = int(expert_idx) + expert_offset
-                yield f"{prefix}mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.{param_type}{expert_idx}", param
+                yield f"{prefix}mtp.layers.{layer_idx}.{layer_path}mlp.experts.{rest}.{param_type}{expert_idx}", param
                 continue
 
             layer_idx, rest = match.groups()
