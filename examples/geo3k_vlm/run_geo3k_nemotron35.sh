@@ -19,10 +19,11 @@
 #     stay resident at this size; micro-batch and recompute are already at their
 #     limits. This is mcore 0.16's spelling -- on 0.20 use
 #     `--optimizer-cpu-offload --use-precision-aware-optimizer` instead.
-#   * no MTP speculative decoding. The option is real (this checkpoint has an
-#     MTP layer), but in the Qwen GRPO case SGLang returned a None inside
-#     meta_info["output_token_logprobs"] during eval, and GRPO needs a real log
-#     prob for every trainable response token. USE_MTP=1 turns it back on.
+#   * MTP speculative decoding on by default. This checkpoint has one MTP layer
+#     (attention + MoE); SGLang runs EAGLE with it as the draft. USE_MTP=0
+#     turns it off on both sides. The Qwen GRPO case hit a None inside
+#     meta_info["output_token_logprobs"] during eval; that issue is resolved
+#     here, so the default is flipped to 1.
 #   * scripts/models/nemotron3.5-super-vl.sh, which sources the Nemotron 3 text
 #     config and overrides only --spec: the two models' language configs are
 #     field-for-field identical, and the spec is what hangs the C-RADIO v4-H
@@ -173,8 +174,8 @@ SGLANG_ARGS=(
    #   model's tower is C-RADIO v4-H, served by sglang's own radio.py.
 )
 
-# MTP speculative decoding, off by default -- see the header.
-if [ "${USE_MTP:-0}" = "1" ]; then
+# MTP speculative decoding, on by default -- see the header. USE_MTP=0 disables.
+if [ "${USE_MTP:-1}" = "1" ]; then
    SGLANG_ARGS+=(
       --sglang-speculative-algorithm EAGLE
       --sglang-speculative-num-steps 2
