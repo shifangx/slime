@@ -308,6 +308,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
             )
+            parser.add_argument(
+                "--pass-prompt-token-mask",
+                action="store_true",
+                help=(
+                    "Opt in to passing a packed, CP-aligned prompt-position mask during scoring and training. "
+                    "Requires model support; for example, Nemotron SuperVL uses it to distinguish prompt image "
+                    "placeholders from generated <image> tokens. Disabled by default."
+                ),
+            )
 
             return parser
 
@@ -1771,6 +1780,8 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    if args.pass_prompt_token_mask and getattr(args, "overlap_moe_expert_parallel_comm", False):
+        raise ValueError("--pass-prompt-token-mask is not supported with --overlap-moe-expert-parallel-comm")
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.rollout_temperature <= 0:

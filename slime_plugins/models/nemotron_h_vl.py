@@ -205,6 +205,7 @@ class NemotronHVLModel(MegatronModule):
         cu_seqlens: torch.Tensor,
         cp_group,
         pixel_values: torch.Tensor,
+        full_prompt_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None).clone()
         embeddings_bsh = embeddings.transpose(0, 1).contiguous()
@@ -270,6 +271,11 @@ class NemotronHVLModel(MegatronModule):
         if isinstance(pixel_values, (list, tuple)):
             per_image = []
             for image in pixel_values:
+                # Variable-resolution processors return individual CHW images.
+                if image.ndim == 3:
+                    image = image.unsqueeze(0)
+                if image.ndim != 4:
+                    raise ValueError("Vision images must have CHW or NCHW shape")
                 features = self.vision_projector(image.to(dtype=projector_dtype), self.vision_model)
                 per_image.append(features.reshape(-1, features.shape[-1]))
             vision_output = torch.cat(per_image, dim=0)
@@ -281,9 +287,12 @@ class NemotronHVLModel(MegatronModule):
             device=embeddings.device, dtype=embeddings.dtype
         )
 
-        full_vision_positions = (
-            (full_input_ids[0] == self.img_context_token_id).nonzero(as_tuple=False).flatten()
-        )
+        full_vision_mask = full_input_ids == self.img_context_token_id
+        if full_prompt_token_mask is not None:
+            if full_prompt_token_mask.dtype != torch.bool or full_prompt_token_mask.shape != full_input_ids.shape:
+                raise ValueError("Prompt token mask must be boolean and match the full packed sequence")
+            full_vision_mask = full_vision_mask & full_prompt_token_mask
+        full_vision_positions = full_vision_mask[0].nonzero(as_tuple=False).flatten()
         if full_vision_positions.numel() != vision_embeddings.shape[0]:
             raise ValueError(
                 f"Nemotron 3.5 VL token/feature mismatch: {full_vision_positions.numel()} "
@@ -301,7 +310,13 @@ class NemotronHVLModel(MegatronModule):
         )
         local_feature_indices = feature_indices if local_indices is None else feature_indices[local_indices]
         local_vision_mask = local_feature_indices >= 0
-        if not torch.equal(local_vision_mask, input_ids[0] == self.img_context_token_id):
+        expected_local_mask = input_ids[0] == self.img_context_token_id
+        if full_prompt_token_mask is not None:
+            local_prompt_mask = full_prompt_token_mask[0]
+            if local_indices is not None:
+                local_prompt_mask = local_prompt_mask[local_indices]
+            expected_local_mask = expected_local_mask & local_prompt_mask
+        if not torch.equal(local_vision_mask, expected_local_mask):
             raise ValueError("Nemotron 3.5 VL CP token layout does not match its full packed sequence")
         embeddings_bsh[0, local_vision_mask] = vision_embeddings[local_feature_indices[local_vision_mask]]
 
@@ -318,6 +333,7 @@ class NemotronHVLModel(MegatronModule):
         labels: torch.Tensor | None = None,
         packed_seq_params: PackedSeqParams | None = None,
         loss_mask: torch.Tensor | None = None,
+        prompt_token_mask: torch.Tensor | None = None,
         pixel_values: torch.Tensor | list[torch.Tensor] | None = None,
         # The processor also emits num_patches / num_tokens / imgs_sizes, which
         # slime forwards verbatim from multimodal_train_inputs. The projector
@@ -362,12 +378,20 @@ class NemotronHVLModel(MegatronModule):
                 )
             cp_group = mpu.get_context_parallel_group()
             full_input_ids = gather_packed_input_ids(input_ids, packed_seq_params.cu_seqlens_q, cp_group)
+            full_prompt_token_mask = None
+            if prompt_token_mask is not None:
+                if prompt_token_mask.dtype != torch.bool or prompt_token_mask.shape != input_ids.shape:
+                    raise ValueError("Prompt token mask must be boolean and match local input IDs")
+                full_prompt_token_mask = gather_packed_input_ids(
+                    prompt_token_mask, packed_seq_params.cu_seqlens_q, cp_group
+                )
             decoder_input = self._inject_vision_embeddings(
                 input_ids,
                 full_input_ids,
                 packed_seq_params.cu_seqlens_q,
                 cp_group,
                 pixel_values,
+                full_prompt_token_mask,
             )
 
         return self.language_model(
