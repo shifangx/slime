@@ -1,0 +1,40 @@
+diff --git a/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py b/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
+--- a/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
++++ b/python/sglang/srt/multimodal/processors/nano_nemotron_vl.py
+@@ -175,6 +175,24 @@
+     def render_image_dynamic(self, *, num_tokens: int):
+         return f"{self.IMG_START_TOKEN}{self.IMG_CONTEXT_TOKEN * num_tokens}{self.IMG_END_TOKEN}"
+ 
++    def expand_image_placeholders(self, prompt, rendered_images):
++        # TODO: Upstream to SGLang; remove this patch once included in our pinned dependency.
++        parts = prompt.split(self.IMG_CONTEXT_TOKEN)
++        count = len(parts) - 1
++        if count == 1:
++            # Preserve the existing single-placeholder grouped-image contract.
++            return parts[0] + "".join(rendered_images) + parts[1]
++        if count != len(rendered_images):
++            raise ValueError(
++                f"Image placeholder count {count} does not match "
++                f"image count {len(rendered_images)}"
++            )
++        # Split once: inserted expansions themselves contain the image token.
++        return parts[0] + "".join(
++            image + tail
++            for image, tail in zip(rendered_images, parts[1:], strict=True)
++        )
++
+     def render_tubelet(
+         self,
+         tubelet_index: int,
+@@ -309,4 +327,4 @@
+             ]
+-            prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
++            prompt = self.expand_image_placeholders(prompt, rendered_images)
+             image_feature = preprocessed_images
+         elif base_output.images:
+@@ -319,4 +337,4 @@
+             ]
+-            prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
++            prompt = self.expand_image_placeholders(prompt, rendered_images)
+             image_feature = torch.cat(preprocessed_images, dim=0)
+ 
