@@ -17,6 +17,8 @@ def get_batch(
     keys: Sequence[str],
     pad_multiplier: int = 128,
     allgather_cp: bool = False,
+    *,
+    build_prompt_token_mask: bool = False,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -31,6 +33,7 @@ def get_batch(
         data_iterator: Iterator providing micro-batch data.
         keys: List of keys to fetch from the iterator.
         pad_multiplier: Multiplier for padding size calculation (default: 128).
+        build_prompt_token_mask: Add a boolean prompt-ownership mask in the exact token layout.
 
     Returns a dict including:
     - "tokens": torch.LongTensor of shape [1, T_padded] on the current CUDA device
@@ -108,6 +111,24 @@ def get_batch(
 
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
+
+    if build_prompt_token_mask:
+        # Prompt ownership is independent of reward masking and next-token loss shifting.
+        prompt_masks = []
+        for original, total, response in zip(
+            batch["unconcat_tokens"], batch["total_lengths"], batch["response_lengths"], strict=True
+        ):
+            if original.numel() != total or not 0 <= response <= total:
+                raise ValueError("Invalid prompt/response lengths for prompt token mask")
+            mask = torch.arange(total, device=original.device) < total - response
+            prompt_masks.append(mask if allgather_cp else slice_with_cp(mask, False))
+        prompt_mask = F.pad(torch.cat(prompt_masks), (0, pad), value=False)
+        if allgather_cp:
+            prompt_mask = prompt_mask.chunk(cp_size, dim=0)[cp_rank]
+        prompt_mask = prompt_mask.unsqueeze(0)
+        if prompt_mask.shape != tokens.shape:
+            raise ValueError("Prompt token mask does not match packed token layout")
+        batch["prompt_token_mask"] = prompt_mask
 
     # loss masks
     loss_masks = []

@@ -417,6 +417,7 @@ def forward_only(
             batch_keys,
             args.data_pad_size_multiplier,
             args.allgather_cp,
+            build_prompt_token_mask=args.pass_prompt_token_mask,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -433,6 +434,10 @@ def forward_only(
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
+        # Opt-in model input, e.g. SuperVL restricts vision insertion to prompt tokens.
+        # Models without --pass-prompt-token-mask receive no additional keyword.
+        if "prompt_token_mask" in batch:
+            forward_kwargs["prompt_token_mask"] = batch["prompt_token_mask"]
         output_tensor = model(**forward_kwargs)
 
         output_kwargs = {
@@ -603,6 +608,7 @@ def train_one_step(
             ),
             args.data_pad_size_multiplier,
             args.allgather_cp,
+            build_prompt_token_mask=args.pass_prompt_token_mask,
         )
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
@@ -610,6 +616,8 @@ def train_one_step(
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
         if return_schedule_plan:
+            if "prompt_token_mask" in batch:
+                raise ValueError("Prompt token mask requires the standard model forward path")
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             position_ids = None
             output_tensor = model.build_schedule_plan(
@@ -632,6 +640,10 @@ def train_one_step(
 
             if batch["multimodal_train_inputs"] is not None:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
+            # Same opt-in metadata as scoring: SuperVL uses it for vision insertion,
+            # not to mask response-token losses or change the attention mask.
+            if "prompt_token_mask" in batch:
+                forward_kwargs["prompt_token_mask"] = batch["prompt_token_mask"]
 
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}

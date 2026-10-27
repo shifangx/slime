@@ -177,8 +177,17 @@ def test_update_weight_disk_dir_required_for_disk_transport(monkeypatch):
         module.slime_validate_args(args)
 
 
+@pytest.mark.unit
+def test_prompt_mask_rejects_combined_1f1b(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(pass_prompt_token_mask=True, overlap_moe_expert_parallel_comm=True)
+    with pytest.raises(ValueError, match="--pass-prompt-token-mask.*--overlap-moe"):
+        module.slime_validate_args(args)
+
+
 def make_slime_validate_args(**overrides):
     values = dict(
+        pass_prompt_token_mask=False,
         eval_config=None,
         eval_prompt_data=None,
         kl_coef=0,

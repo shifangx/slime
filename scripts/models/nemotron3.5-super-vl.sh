@@ -17,3 +17,5 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/nemotron3-super-120b
 
 MODEL_ARGS[1]="slime_plugins.models.nemotron_h_vl"
 MODEL_ARGS[2]="get_nemotron_h_vl_model_provider"
+# SuperVL must distinguish prompt image placeholders from generated <image> tokens.
+MODEL_ARGS+=(--pass-prompt-token-mask)
