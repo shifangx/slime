@@ -271,6 +271,11 @@ class NemotronHVLModel(MegatronModule):
         if isinstance(pixel_values, (list, tuple)):
             per_image = []
             for image in pixel_values:
+                # Variable-resolution processors return individual CHW images.
+                if image.ndim == 3:
+                    image = image.unsqueeze(0)
+                if image.ndim != 4:
+                    raise ValueError("Vision images must have CHW or NCHW shape")
                 features = self.vision_projector(image.to(dtype=projector_dtype), self.vision_model)
                 per_image.append(features.reshape(-1, features.shape[-1]))
             vision_output = torch.cat(per_image, dim=0)
